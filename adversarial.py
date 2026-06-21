@@ -202,68 +202,57 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
     num_perturb = max(1, int(num_total_edges * ratio))
 
     x = data.x.to(device)
-    edge_index = data.edge_index.to(device)
     num_nodes = data.num_nodes
+    y = data.y.to(device)
+
+    if hasattr(data, 'test_mask') and data.test_mask is not None and data.test_mask.sum() > 0:
+        target_mask = data.test_mask.to(device)
+    elif hasattr(data, 'val_mask') and data.val_mask is not None and data.val_mask.sum() > 0:
+        target_mask = data.val_mask.to(device)
+    else:
+        target_mask = torch.ones(num_nodes, dtype=torch.bool, device=device)
 
     adj = torch.zeros(num_nodes, num_nodes, device=device)
-    adj[edge_index[0], edge_index[1]] = 1.0
-
-    adj_norm = adj + torch.eye(num_nodes, device=device)
-    deg = adj_norm.sum(dim=1)
-    deg_inv_sqrt = deg.pow(-0.5)
-    deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-    adj_norm = deg_inv_sqrt.unsqueeze(1) * adj_norm * deg_inv_sqrt.unsqueeze(0)
-
-    try:
-        first_weight = None
-        first_bias = None
-        last_weight = None
-        last_bias = None
-        for name, param in model.named_parameters():
-            if 'lin.weight' in name or ('weight' in name and 'lin' not in name):
-                last_weight = param.detach()
-                if first_weight is None:
-                    first_weight = param.detach()
-            if 'bias' in name and 'lin' not in name:
-                last_bias = param.detach()
-                if first_bias is None:
-                    first_bias = param.detach()
-
-        if first_weight is None or last_weight is None:
-            raise ValueError("No weights found")
-
-        h = adj_norm.detach() @ x @ first_weight.t()
-        if first_bias is not None:
-            h = h + first_bias
-        h = F.relu(h)
-        h = F.dropout(h, p=0.5, training=False)
-        if last_weight.shape[1] != h.shape[1]:
-            if h.shape[1] > last_weight.shape[1]:
-                h = h[:, :last_weight.shape[1]]
-            else:
-                pad = last_weight.shape[1] - h.shape[1]
-                h = torch.cat([h, torch.zeros(h.shape[0], pad, device=device)], dim=1)
-        proxy_out = adj_norm.detach() @ h @ last_weight.t()
-        if last_bias is not None:
-            proxy_out = proxy_out + last_bias
-    except Exception:
-        proxy_out = model(x, edge_index)
+    adj[data.edge_index[0], data.edge_index[1]] = 1.0
 
     adj_var = adj.clone().detach().requires_grad_(True)
-    deg_var = adj_var.sum(dim=1) + 1
-    deg_inv_sqrt_var = deg_var.pow(-0.5)
-    deg_inv_sqrt_var[deg_inv_sqrt_var == float('inf')] = 0
-    adj_norm_var = deg_inv_sqrt_var.unsqueeze(1) * (adj_var + torch.eye(num_nodes, device=device)) * deg_inv_sqrt_var.unsqueeze(0)
 
-    h_base = x @ first_weight.t() if first_weight is not None else x
-    if first_bias is not None:
-        h_base = h_base + first_bias
-    proxy_out_var = adj_norm_var @ h_base.detach()
+    adj_with_self = adj_var + torch.eye(num_nodes, device=device)
+    deg = adj_with_self.sum(dim=1)
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt = torch.where(torch.isinf(deg_inv_sqrt), torch.zeros_like(deg_inv_sqrt), deg_inv_sqrt)
+    adj_norm = deg_inv_sqrt.unsqueeze(1) * adj_with_self * deg_inv_sqrt.unsqueeze(0)
 
-    if hasattr(data, 'train_mask') and data.train_mask is not None:
-        loss = F.cross_entropy(proxy_out_var[data.train_mask], data.y[data.train_mask].to(device))
-    else:
-        loss = F.cross_entropy(proxy_out_var, data.y.to(device))
+    conv_weights = []
+    conv_biases = []
+    activation = None
+    for name, param in model.named_parameters():
+        if 'lin.weight' in name:
+            conv_weights.append(param.detach())
+        elif 'bias' in name and 'lin' not in name:
+            conv_biases.append(param.detach())
+
+    if len(conv_weights) == 0:
+        for name, param in model.named_parameters():
+            if 'weight' in name and param.dim() == 2:
+                conv_weights.append(param.detach())
+            elif 'bias' in name and param.dim() == 1:
+                conv_biases.append(param.detach())
+
+    h = x
+    for i in range(len(conv_weights)):
+        w = conv_weights[i]
+        h = adj_norm @ h @ w.t()
+        if i < len(conv_biases) and i < len(conv_weights) - 1:
+            h = h + conv_biases[i]
+        if i < len(conv_weights) - 1:
+            h = F.relu(h)
+    if len(conv_biases) == len(conv_weights) and len(conv_biases) > 0:
+        h = h + conv_biases[-1]
+
+    out = h
+
+    loss = F.cross_entropy(out[target_mask], y[target_mask])
     loss.backward()
 
     grad = adj_var.grad.detach()
@@ -288,8 +277,8 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
 
     elif mode == 'flip':
-        n_add = num_perturb // 2
-        n_remove = num_perturb - n_add
+        n_remove = num_perturb // 2
+        n_add = num_perturb - n_remove
 
         edge_grad = {}
         for u, v in existing:
@@ -301,8 +290,8 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
                 if (u, v) not in existing:
                     non_existing_grad[(u, v)] = grad_score[u, v].item()
 
-        edges_add = _select_edges_to_add(data, n_add, priority_scores=non_existing_grad)
         edges_remove = _select_edges_to_remove(data, n_remove, priority_scores=edge_grad)
+        edges_add = _select_edges_to_add(data, n_add, priority_scores=non_existing_grad)
         return _apply_edge_changes(data, edges_to_add=edges_add, edges_to_remove=edges_remove)
     else:
         raise ValueError(f"Unknown mode: {mode}")

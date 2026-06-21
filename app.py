@@ -1414,10 +1414,7 @@ with tab6:
 
                     with vc2:
                         G_attacked = to_networkx(attacked_data, to_undirected=True)
-                        try:
-                            pos_attacked = compute_layout(G_attacked, layout='spring', seed=42)
-                        except Exception:
-                            pos_attacked = st.session_state.pos
+                        pos_attacked = st.session_state.pos
 
                         has_labels = st.session_state.num_classes > 0
                         colors_att = None
@@ -1425,15 +1422,14 @@ with tab6:
                             colors_att = data.y.cpu().numpy().tolist()
 
                         edge_traces = []
-                        perturbed_edge_set = added | removed
 
                         for u, v in G_attacked.edges():
                             x0, y0 = pos_attacked.get(u, (0, 0))
                             x1, y1 = pos_attacked.get(v, (0, 0))
                             key = (min(u, v), max(u, v))
-                            is_perturbed = key in perturbed_edge_set
-                            ec = '#FF0000' if is_perturbed else 'rgba(150, 150, 150, 0.4)'
-                            ew = 2.5 if is_perturbed else 0.8
+                            is_added = key in added
+                            ec = '#FF2222' if is_added else 'rgba(180, 180, 180, 0.5)'
+                            ew = 2.5 if is_added else 0.8
 
                             edge_traces.append(go.Scatter(
                                 x=[x0, x1, None], y=[y0, y1, None],
@@ -1443,13 +1439,22 @@ with tab6:
                                 showlegend=False
                             ))
 
-                        node_x = [pos_attacked.get(n, (0, 0))[0] for n in G_attacked.nodes()]
-                        node_y = [pos_attacked.get(n, (0, 0))[1] for n in G_attacked.nodes()]
+                        for u, v in removed:
+                            x0, y0 = pos_attacked.get(u, (0, 0))
+                            x1, y1 = pos_attacked.get(v, (0, 0))
+                            edge_traces.append(go.Scatter(
+                                x=[x0, x1, None], y=[y0, y1, None],
+                                mode='lines',
+                                line=dict(width=2.5, color='#FF2222', dash='dash'),
+                                hoverinfo='none',
+                                showlegend=False
+                            ))
 
                         normal_nodes_x, normal_nodes_y, normal_colors = [], [], []
-                        affected_nodes_x, affected_nodes_y, affected_colors = [], [], []
+                        affected_nodes_x, affected_nodes_y, affected_colors = [], []
 
-                        for idx_n, n in enumerate(G_attacked.nodes()):
+                        all_nodes = list(G_attacked.nodes())
+                        for idx_n, n in enumerate(all_nodes):
                             px, py = pos_attacked.get(n, (0, 0))
                             c = colors_att[idx_n] if colors_att and idx_n < len(colors_att) else 0
                             if n in affected_nodes:
@@ -1470,12 +1475,12 @@ with tab6:
                                 mode='markers',
                                 marker=dict(
                                     size=10, colorscale=color_scale,
-                                    color=normal_colors, line_width=1, line_color='white',
+                                    color=normal_colors, line_width=1.5, line_color='white',
                                     showscale=True,
                                     colorbar=dict(thickness=15, title=dict(text='类别', side='right'), xanchor='left')
                                 ),
                                 hoverinfo='text',
-                                hovertext=[f'节点{n}' for n in G_attacked.nodes() if n not in affected_nodes],
+                                hovertext=[f'节点{n}' for n in all_nodes if n not in affected_nodes],
                                 showlegend=False,
                                 name='正常节点'
                             ))
@@ -1485,25 +1490,27 @@ with tab6:
                                 x=affected_nodes_x, y=affected_nodes_y,
                                 mode='markers',
                                 marker=dict(
-                                    size=14, colorscale=color_scale,
+                                    size=15, colorscale=color_scale,
                                     color=affected_colors, symbol='triangle-up',
-                                    line_width=2, line_color='red',
+                                    line_width=2.5, line_color='#FF0000',
                                     showscale=False
                                 ),
                                 hoverinfo='text',
-                                hovertext=[f'受影响节点{n}' for n in affected_nodes],
+                                hovertext=[f'受影响节点{n}' for n in affected_nodes if n in G_attacked.nodes()],
                                 showlegend=False,
                                 name='受影响节点'
                             ))
 
                         fig_att = go.Figure(data=edge_traces)
                         fig_att.update_layout(
-                            title='攻击后的图（红色=被扰动边，三角形=受影响节点）',
+                            title='攻击后的图（红实线=新增边，红虚线=删除边，三角形=受影响节点）',
                             template=theme['template'],
                             height=550, showlegend=False, hovermode='closest',
                             margin=dict(l=5, r=5, t=50, b=5),
-                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                                       range=[min(p[0] for p in pos_attacked.values())*1.1, max(p[0] for p in pos_attacked.values())*1.1] if pos_attacked else None),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                                       range=[min(p[1] for p in pos_attacked.values())*1.1, max(p[1] for p in pos_attacked.values())*1.1] if pos_attacked else None)
                         )
                         st.plotly_chart(fig_att, use_container_width=True)
 
