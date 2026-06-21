@@ -146,35 +146,6 @@ def _get_1hop_of_target(data):
     return neighbors
 
 
-def _perturb_test_node_features(attacked_data, num_nodes_modify=0):
-    if num_nodes_modify <= 0:
-        return attacked_data
-    target_nodes = sorted(list(_get_target_nodes(attacked_data)))
-    if len(target_nodes) == 0:
-        return attacked_data
-
-    n_sel = min(num_nodes_modify, len(target_nodes))
-    selected_indices = np.random.choice(len(target_nodes), size=n_sel, replace=False)
-
-    labels = attacked_data.y.cpu().numpy() if attacked_data.y is not None else None
-    x_new = attacked_data.x.clone()
-
-    for si in selected_indices:
-        tn = target_nodes[si]
-        if labels is not None:
-            tn_lab = int(labels[tn])
-            other_nodes = [n for n in range(attacked_data.num_nodes) if int(labels[n]) != tn_lab and n != tn]
-            if len(other_nodes) > 0:
-                pick = other_nodes[np.random.randint(len(other_nodes))]
-                x_new[tn] = attacked_data.x[pick].clone()
-        else:
-            x_new[tn] = x_new[tn] + torch.randn_like(x_new[tn]) * 0.5
-
-    out = attacked_data.clone()
-    out.x = x_new
-    return out
-
-
 def random_attack(data, ratio, mode='flip', seed=None):
     if seed is not None:
         np.random.seed(seed)
@@ -218,6 +189,27 @@ def random_attack(data, ratio, mode='flip', seed=None):
                         w = 15.0
                     else:
                         w = 0.5
+            elif not for_adding and labels is not None:
+                lab_u = int(labels[u])
+                lab_v = int(labels[v])
+                if lab_u == lab_v:
+                    if u_is_t and v_is_t:
+                        w = 1000.0
+                    elif u_is_t or v_is_t:
+                        w = 800.0
+                    elif u_in_h and v_in_h:
+                        w = 80.0
+                    else:
+                        w = 8.0
+                else:
+                    if u_is_t and v_is_t:
+                        w = 100.0
+                    elif u_is_t or v_is_t:
+                        w = 80.0
+                    elif u_in_h and v_in_h:
+                        w = 15.0
+                    else:
+                        w = 0.5
             else:
                 if u_is_t and v_is_t:
                     w = 100.0
@@ -251,9 +243,7 @@ def random_attack(data, ratio, mode='flip', seed=None):
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
         edges = _weighted_sample_edges(existing_list, num_perturb, target_nodes, target_1hop, labels, for_adding=False)
-        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
-        n_feat = max(1, int(len(target_nodes) * min(ratio * 2.5, 0.8)))
-        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
+        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
@@ -279,7 +269,7 @@ def degree_attack(data, ratio, mode='flip'):
     target_1hop = _get_1hop_of_target(data)
     labels = data.y.cpu().numpy() if data.y is not None else None
 
-    def _attack_score(u, v):
+    def _attack_score(u, v, for_adding=True):
         base_deg = max(degree_scores[u], degree_scores[v])
         min_deg = min(degree_scores[u], degree_scores[v])
         deg_component = base_deg + min_deg * 0.3
@@ -294,53 +284,76 @@ def degree_attack(data, ratio, mode='flip'):
             lu = int(labels[u])
             lv = int(labels[v])
             cross_label = lu != lv
+            same_label = lu == lv
         else:
             cross_label = False
+            same_label = False
 
-        if u_is_t and v_is_t:
-            if cross_label:
-                label_component = 1.0e7
+        if for_adding:
+            if u_is_t and v_is_t:
+                if cross_label:
+                    label_component = 1.0e7
+                else:
+                    label_component = 1.0e5 / max(max(degree_scores[u], degree_scores[v]), 1)
+            elif u_is_t or v_is_t:
+                tn = u if u_is_t else v
+                tn_deg = degree_scores[tn]
+                if cross_label:
+                    label_component = 1.0e6 / max(tn_deg, 1)
+                else:
+                    label_component = 1.0e4 / max(tn_deg, 1)
+            elif u_in_h and v_in_h:
+                if cross_label:
+                    label_component = 1.0e3 / max(max(degree_scores[u], degree_scores[v]), 1)
+                else:
+                    label_component = 10.0 / max(max(degree_scores[u], degree_scores[v]), 1)
+            elif u_in_h or v_in_h:
+                label_component = 1.0 / max(min_deg, 1)
             else:
-                label_component = 1.0e5 / max(max(degree_scores[u], degree_scores[v]), 1)
-        elif u_is_t or v_is_t:
-            tn = u if u_is_t else v
-            tn_deg = degree_scores[tn]
-            if cross_label:
-                label_component = 1.0e6 / max(tn_deg, 1)
-            else:
-                label_component = 1.0e4 / max(tn_deg, 1)
-        elif u_in_h and v_in_h:
-            if cross_label:
-                label_component = 1.0e3 / max(max(degree_scores[u], degree_scores[v]), 1)
-            else:
-                label_component = 10.0 / max(max(degree_scores[u], degree_scores[v]), 1)
-        elif u_in_h or v_in_h:
-            label_component = 1.0 / max(min_deg, 1)
+                label_component = 0.0001
         else:
-            label_component = 0.0001
+            if same_label:
+                if u_is_t and v_is_t:
+                    label_component = 1.0e7 / max(max(degree_scores[u], degree_scores[v]), 1)
+                elif u_is_t or v_is_t:
+                    tn = u if u_is_t else v
+                    tn_deg = degree_scores[tn]
+                    label_component = 1.0e6 / max(tn_deg, 1)
+                elif u_in_h and v_in_h:
+                    label_component = 1.0e3 / max(max(degree_scores[u], degree_scores[v]), 1)
+                else:
+                    label_component = 10.0 / max(max(degree_scores[u], degree_scores[v]), 1)
+            else:
+                if u_is_t and v_is_t:
+                    label_component = 1.0e4 / max(max(degree_scores[u], degree_scores[v]), 1)
+                elif u_is_t or v_is_t:
+                    tn = u if u_is_t else v
+                    tn_deg = degree_scores[tn]
+                    label_component = 1.0e3 / max(tn_deg, 1)
+                elif u_in_h and v_in_h:
+                    label_component = 10.0 / max(max(degree_scores[u], degree_scores[v]), 1)
+                else:
+                    label_component = 0.0001
 
         return label_component + deg_component * 0.000001
 
     edge_priority = {}
     existing = _get_existing_edges(data)
     for u, v in existing:
-        edge_priority[(u, v)] = _attack_score(u, v)
+        edge_priority[(u, v)] = _attack_score(u, v, for_adding=False)
 
     add_priority = {}
     for u in range(num_nodes):
         for v in range(u + 1, num_nodes):
             if (u, v) not in existing:
-                add_priority[(u, v)] = _attack_score(u, v)
+                add_priority[(u, v)] = _attack_score(u, v, for_adding=True)
 
     if mode == 'add':
         edges = _select_edges_to_add(data, num_perturb, priority_scores=add_priority)
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
         edges = _select_edges_to_remove(data, num_perturb, priority_scores=edge_priority)
-        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
-        target_nodes = list(_get_target_nodes(data))
-        n_feat = max(1, int(len(target_nodes) * min(ratio * 3.0, 0.8)))
-        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
+        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
@@ -418,24 +431,83 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
     grad = adj_var.grad.detach()
     grad_score = (grad.abs() + grad.abs().t()) / 2.0
 
+    target_nodes = _get_target_nodes(data)
+    target_1hop = _get_1hop_of_target(data)
+    labels = data.y.cpu().numpy() if data.y is not None else None
+
+    def _weighted_score(u, v, base_score, for_adding=True):
+        u_is_t = u in target_nodes
+        v_is_t = v in target_nodes
+        u_in_h = u in target_1hop
+        v_in_h = v in target_1hop
+        label_mult = 1.0
+        if labels is not None:
+            lu = int(labels[u])
+            lv = int(labels[v])
+            if for_adding:
+                if lu != lv:
+                    if u_is_t and v_is_t:
+                        label_mult = 1000.0
+                    elif u_is_t or v_is_t:
+                        label_mult = 500.0
+                    elif u_in_h and v_in_h:
+                        label_mult = 50.0
+                    else:
+                        label_mult = 5.0
+                else:
+                    if u_is_t and v_is_t:
+                        label_mult = 100.0
+                    elif u_is_t or v_is_t:
+                        label_mult = 80.0
+                    elif u_in_h and v_in_h:
+                        label_mult = 15.0
+                    else:
+                        label_mult = 0.5
+            else:
+                if lu == lv:
+                    if u_is_t and v_is_t:
+                        label_mult = 1000.0
+                    elif u_is_t or v_is_t:
+                        label_mult = 800.0
+                    elif u_in_h and v_in_h:
+                        label_mult = 80.0
+                    else:
+                        label_mult = 8.0
+                else:
+                    if u_is_t and v_is_t:
+                        label_mult = 100.0
+                    elif u_is_t or v_is_t:
+                        label_mult = 80.0
+                    elif u_in_h and v_in_h:
+                        label_mult = 15.0
+                    else:
+                        label_mult = 0.5
+        else:
+            if u_is_t and v_is_t:
+                label_mult = 100.0
+            elif u_is_t or v_is_t:
+                label_mult = 80.0
+            elif u_in_h and v_in_h:
+                label_mult = 15.0
+            else:
+                label_mult = 0.5
+        return base_score * label_mult + label_mult * 1e-8
+
     existing = _get_existing_edges(data)
 
     if mode == 'remove':
         edge_grad = {}
         for u, v in existing:
-            edge_grad[(u, v)] = grad_score[u, v].item()
+            edge_grad[(u, v)] = _weighted_score(u, v, grad_score[u, v].item(), for_adding=False)
         edges = _select_edges_to_remove(data, num_perturb, priority_scores=edge_grad)
-        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
-        target_nodes = list(_get_target_nodes(data))
-        n_feat = max(1, int(len(target_nodes) * min(ratio * 3.0, 0.8)))
-        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
+        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
 
     elif mode == 'add':
         non_existing_grad = {}
         for u in range(num_nodes):
             for v in range(u + 1, num_nodes):
                 if (u, v) not in existing:
-                    non_existing_grad[(u, v)] = grad_score[u, v].item()
+                    non_existing_grad[(u, v)] = _weighted_score(u, v, grad_score[u, v].item(), for_adding=True)
         edges = _select_edges_to_add(data, num_perturb, priority_scores=non_existing_grad)
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
 
@@ -445,13 +517,13 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
 
         edge_grad = {}
         for u, v in existing:
-            edge_grad[(u, v)] = grad_score[u, v].item()
+            edge_grad[(u, v)] = _weighted_score(u, v, grad_score[u, v].item(), for_adding=False)
 
         non_existing_grad = {}
         for u in range(num_nodes):
             for v in range(u + 1, num_nodes):
                 if (u, v) not in existing:
-                    non_existing_grad[(u, v)] = grad_score[u, v].item()
+                    non_existing_grad[(u, v)] = _weighted_score(u, v, grad_score[u, v].item(), for_adding=True)
 
         edges_remove = _select_edges_to_remove(data, n_remove, priority_scores=edge_grad)
         edges_add = _select_edges_to_add(data, n_add, priority_scores=non_existing_grad)
@@ -494,13 +566,47 @@ def degree_filter_defense(original_data, attacked_data, threshold_percentile=90)
     return defended_data
 
 
-def feature_smoothing_defense(attacked_data, original_data=None, alpha=0.3):
+def feature_smoothing_defense(attacked_data, original_data=None, alpha=0.4):
     new_data = attacked_data.clone()
 
     if original_data is not None:
-        edge_index = original_data.edge_index
+        original_edges = _get_existing_edges(original_data)
+        attacked_edges = _get_existing_edges(attacked_data)
+        new_edges = attacked_edges - original_edges
+        removed_edges = original_edges - attacked_edges
+        labels = attacked_data.y.cpu().numpy() if attacked_data.y is not None else None
+
+        edge_index = attacked_data.edge_index
+        num_nodes = attacked_data.num_nodes
+        degree_counts = torch.zeros(num_nodes)
+        for i in range(edge_index.shape[1]):
+            degree_counts[edge_index[0, i]] += 1
+        degree_np = degree_counts.numpy()
+        if degree_np[degree_np > 0].size > 0:
+            threshold = np.percentile(degree_np[degree_np > 0], 90)
+        else:
+            threshold = float('inf')
+
+        edges_to_remove = []
+        for u, v in new_edges:
+            is_cross_label = False
+            if labels is not None:
+                is_cross_label = int(labels[u]) != int(labels[v])
+            is_high_degree = degree_np[u] > threshold or degree_np[v] > threshold
+            if is_cross_label or is_high_degree:
+                edges_to_remove.append((u, v))
+
+        edges_to_restore = list(removed_edges)
+
+        preprocessed = _apply_edge_changes(
+            attacked_data, edges_to_add=edges_to_restore, edges_to_remove=edges_to_remove
+        )
+        new_data.edge_index = preprocessed.edge_index
+        edge_index = preprocessed.edge_index
+        x = attacked_data.x.float()
     else:
         edge_index = attacked_data.edge_index
+        x = attacked_data.x.float()
 
     num_nodes = attacked_data.num_nodes
     row = edge_index[0]
@@ -513,7 +619,6 @@ def feature_smoothing_defense(attacked_data, original_data=None, alpha=0.3):
     deg_inv = 1.0 / deg
     row_norm = deg_inv[row]
 
-    x = attacked_data.x.float()
     smoothed_neighbor = torch.zeros_like(x)
     smoothed_neighbor.index_add_(0, row, x[col] * row_norm.unsqueeze(1))
 
@@ -522,7 +627,7 @@ def feature_smoothing_defense(attacked_data, original_data=None, alpha=0.3):
     if original_data is not None:
         orig_x = original_data.x.float()
         diff = (x - orig_x).abs().mean(dim=-1, keepdim=True)
-        weight = torch.sigmoid(diff * 10.0)
+        weight = torch.sigmoid((diff - 0.01) * 100.0)
         smoothed = (1 - weight) * smoothed + weight * orig_x
 
     new_data.x = smoothed
