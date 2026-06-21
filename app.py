@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import time
 import numpy as np
 import pandas as pd
@@ -1099,7 +1100,7 @@ with tab6:
         if st.session_state.model is not None and st.session_state.results is not None:
             available_models.insert(0, '当前模型')
 
-        adv_tabs = st.tabs(['🎯 单次攻击评估', '📊 批量评估', '⚔️ 防御策略对比', '👁️ 攻击可视化', '💾 结果导出'])
+        adv_tabs = st.tabs(['🎯 单次攻击评估', '📊 批量评估', '⚔️ 防御策略对比', '👁️ 攻击可视化', '💳 鲁棒性评分卡', '💾 结果导出'])
 
         with adv_tabs[0]:
             st.markdown('#### 单次攻击评估')
@@ -1587,6 +1588,166 @@ with tab6:
                         st.warning(f'热力图生成失败: {str(e)}')
 
         with adv_tabs[4]:
+            st.markdown('#### 📋 鲁棒性评分卡')
+            st.caption('对当前模型执行完整鲁棒性评估：3种攻击方法 × 3种攻击模式 × 5个比例点(5%/10%/20%/30%/50%)，共9种组合')
+
+            if st.button('💳 生成评分卡', type='primary', use_container_width=True, key='btn_scorecard'):
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model = st.session_state.model
+                data = st.session_state.data
+
+                methods = list(ATTACK_METHODS.keys())
+                modes = list(ATTACK_MODES.keys())
+                ratios = [0.05, 0.10, 0.20, 0.30, 0.50]
+
+                combinations = [(m, mo) for m in methods for mo in modes]
+
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                scorecard_data = {}
+
+                for idx, (method, mode) in enumerate(combinations):
+                    status_text.markdown(
+                        f'**正在评估第 {idx+1}/9 种组合**: {method} × {mode}'
+                    )
+                    progress_bar.progress(idx / 9)
+
+                    results = batch_evaluate(
+                        model, data, method, ratios, mode,
+                        device=device, seed=42
+                    )
+
+                    avg_drop = np.mean([r['acc_drop'] for r in results])
+                    max_drop = np.max([r['acc_drop'] for r in results])
+
+                    scorecard_data[(method, mode)] = {
+                        'avg_drop': avg_drop,
+                        'max_drop': max_drop,
+                        'details': results,
+                    }
+
+                progress_bar.progress(1.0)
+                status_text.markdown('**✅ 评分卡生成完成！**')
+
+                st.session_state.scorecard_data = scorecard_data
+                st.session_state.scorecard_time = time.strftime('%Y-%m-%d %H:%M:%S')
+
+            if 'scorecard_data' in st.session_state and st.session_state.scorecard_data is not None:
+                scorecard_data = st.session_state.scorecard_data
+                methods = list(ATTACK_METHODS.keys())
+                modes = list(ATTACK_MODES.keys())
+
+                sc_table, sc_radar = st.columns([3, 2])
+
+                with sc_table:
+                    st.markdown('##### 精度下降统计（平均 / 最大）')
+
+                    rows = []
+                    for method in methods:
+                        row = {'攻击方法': method}
+                        for mode in modes:
+                            key = (method, mode)
+                            if key in scorecard_data:
+                                avg = scorecard_data[key]['avg_drop']
+                                mx = scorecard_data[key]['max_drop']
+                                row[mode] = f'{avg:.4f} / {mx:.4f}'
+                            else:
+                                row[mode] = '-'
+                        rows.append(row)
+                    df_scorecard = pd.DataFrame(rows)
+                    st.dataframe(df_scorecard, use_container_width=True, hide_index=True)
+
+                with sc_radar:
+                    dims = []
+                    values = []
+
+                    for method in methods:
+                        drops = [scorecard_data[(method, mode)]['avg_drop'] for mode in modes]
+                        val = 100 - np.mean(drops) * 100
+                        dims.append(f'{method}抵抗力')
+                        values.append(max(0, min(100, val)))
+
+                    for mode in modes:
+                        drops = [scorecard_data[(method, mode)]['avg_drop'] for method in methods]
+                        val = 100 - np.mean(drops) * 100
+                        dims.append(f'{mode}防御力')
+                        values.append(max(0, min(100, val)))
+
+                    fig_radar = go.Figure(data=go.Scatterpolar(
+                        r=values + [values[0]],
+                        theta=dims + [dims[0]],
+                        fill='toself',
+                        line=dict(color='#636EFA', width=2),
+                        name='鲁棒性'
+                    ))
+                    fig_radar.update_layout(
+                        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                        showlegend=False,
+                        title='鲁棒性雷达图',
+                        height=380,
+                        margin=dict(l=40, r=40, t=60, b=40)
+                    )
+                    st.plotly_chart(fig_radar, use_container_width=True)
+
+                all_avg_drops = [scorecard_data[(m, mo)]['avg_drop'] for m in methods for mo in modes]
+                overall_avg = np.mean(all_avg_drops)
+                score = int(max(0, min(100, 100 - overall_avg * 100)))
+
+                if score >= 90:
+                    grade = '极高鲁棒性'
+                elif score >= 70:
+                    grade = '高鲁棒性'
+                elif score >= 50:
+                    grade = '中等鲁棒性'
+                else:
+                    grade = '低鲁棒性'
+
+                st.markdown('---')
+                grade_c1, grade_c2, grade_c3 = st.columns([1, 1, 2])
+                grade_c1.metric('综合鲁棒性评分', f'{score}分')
+                grade_c2.metric('等级标注', grade)
+
+                model_name_str = '未知'
+                if len(st.session_state.training_history) > 0:
+                    model_name_str = st.session_state.training_history[-1]['model_name']
+
+                export_data = {
+                    'model_name': model_name_str,
+                    'dataset_name': st.session_state.dataset_name or '未知',
+                    'generation_time': st.session_state.get('scorecard_time', ''),
+                    'combinations': {},
+                    'comprehensive_score': score,
+                    'grade': grade,
+                }
+                for method in methods:
+                    for mode in modes:
+                        key = (method, mode)
+                        if key in scorecard_data:
+                            export_data['combinations'][f'{method}×{mode}'] = {
+                                'avg_accuracy_drop': round(scorecard_data[key]['avg_drop'], 6),
+                                'max_accuracy_drop': round(scorecard_data[key]['max_drop'], 6),
+                                'ratio_details': [
+                                    {
+                                        'ratio': r['attack_ratio'],
+                                        'acc_before': round(r['acc_before'], 6),
+                                        'acc_after': round(r['acc_after'], 6),
+                                        'acc_drop': round(r['acc_drop'], 6),
+                                    }
+                                    for r in scorecard_data[key]['details']
+                                ]
+                            }
+
+                json_bytes = json.dumps(export_data, ensure_ascii=False, indent=2).encode('utf-8')
+                st.download_button(
+                    '💾 一键导出评分卡(JSON)',
+                    json_bytes,
+                    'robustness_scorecard.json',
+                    'application/json',
+                    use_container_width=True
+                )
+
+        with adv_tabs[5]:
             st.markdown('#### 结果导出')
             if 'adv_batch_results' not in st.session_state or len(st.session_state.adv_batch_results) == 0:
                 st.info('暂无评估结果，请先执行攻击评估')
