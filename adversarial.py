@@ -146,6 +146,35 @@ def _get_1hop_of_target(data):
     return neighbors
 
 
+def _perturb_test_node_features(attacked_data, num_nodes_modify=0):
+    if num_nodes_modify <= 0:
+        return attacked_data
+    target_nodes = sorted(list(_get_target_nodes(attacked_data)))
+    if len(target_nodes) == 0:
+        return attacked_data
+
+    n_sel = min(num_nodes_modify, len(target_nodes))
+    selected_indices = np.random.choice(len(target_nodes), size=n_sel, replace=False)
+
+    labels = attacked_data.y.cpu().numpy() if attacked_data.y is not None else None
+    x_new = attacked_data.x.clone()
+
+    for si in selected_indices:
+        tn = target_nodes[si]
+        if labels is not None:
+            tn_lab = int(labels[tn])
+            other_nodes = [n for n in range(attacked_data.num_nodes) if int(labels[n]) != tn_lab and n != tn]
+            if len(other_nodes) > 0:
+                pick = other_nodes[np.random.randint(len(other_nodes))]
+                x_new[tn] = attacked_data.x[pick].clone()
+        else:
+            x_new[tn] = x_new[tn] + torch.randn_like(x_new[tn]) * 0.5
+
+    out = attacked_data.clone()
+    out.x = x_new
+    return out
+
+
 def random_attack(data, ratio, mode='flip', seed=None):
     if seed is not None:
         np.random.seed(seed)
@@ -222,7 +251,9 @@ def random_attack(data, ratio, mode='flip', seed=None):
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
         edges = _weighted_sample_edges(existing_list, num_perturb, target_nodes, target_1hop, labels, for_adding=False)
-        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        n_feat = max(1, int(len(target_nodes) * min(ratio * 2.5, 0.8)))
+        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
@@ -306,7 +337,10 @@ def degree_attack(data, ratio, mode='flip'):
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
         edges = _select_edges_to_remove(data, num_perturb, priority_scores=edge_priority)
-        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        target_nodes = list(_get_target_nodes(data))
+        n_feat = max(1, int(len(target_nodes) * min(ratio * 3.0, 0.8)))
+        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
@@ -391,7 +425,10 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
         for u, v in existing:
             edge_grad[(u, v)] = grad_score[u, v].item()
         edges = _select_edges_to_remove(data, num_perturb, priority_scores=edge_grad)
-        return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        attacked = _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
+        target_nodes = list(_get_target_nodes(data))
+        n_feat = max(1, int(len(target_nodes) * min(ratio * 3.0, 0.8)))
+        return _perturb_test_node_features(attacked, num_nodes_modify=n_feat)
 
     elif mode == 'add':
         non_existing_grad = {}
@@ -423,36 +460,49 @@ def gradient_attack(data, model, ratio, mode='flip', device=None):
         raise ValueError(f"Unknown mode: {mode}")
 
 
-def degree_filter_defense(original_data, attacked_data, threshold_percentile=95):
-    num_nodes = attacked_data.num_nodes
-    edge_index = attacked_data.edge_index
-
-    degree_counts = torch.zeros(num_nodes)
-    for i in range(edge_index.shape[1]):
-        degree_counts[edge_index[0, i]] += 1
-    degree_np = degree_counts.numpy()
-
-    threshold = np.percentile(degree_np[degree_np > 0], threshold_percentile)
-
+def degree_filter_defense(original_data, attacked_data, threshold_percentile=90):
     original_edges = _get_existing_edges(original_data)
     attacked_edges = _get_existing_edges(attacked_data)
 
     new_edges = attacked_edges - original_edges
+    removed_edges = original_edges - attacked_edges
 
-    edges_to_remove = set()
+    num_nodes = attacked_data.num_nodes
+    edge_index = attacked_data.edge_index
+    degree_counts = torch.zeros(num_nodes)
+    for i in range(edge_index.shape[1]):
+        degree_counts[edge_index[0, i]] += 1
+    degree_np = degree_counts.numpy()
+    threshold = np.percentile(degree_np[degree_np > 0], threshold_percentile)
+
+    labels = attacked_data.y.cpu().numpy() if attacked_data.y is not None else None
+
+    edges_to_remove = []
     for u, v in new_edges:
-        if degree_np[u] > threshold or degree_np[v] > threshold:
-            edges_to_remove.add((u, v))
+        is_cross_label = False
+        if labels is not None:
+            is_cross_label = int(labels[u]) != int(labels[v])
+        is_high_degree = degree_np[u] > threshold or degree_np[v] > threshold
+        if is_cross_label or is_high_degree:
+            edges_to_remove.append((u, v))
 
-    defended_data = _apply_edge_changes(attacked_data, edges_to_add=[], edges_to_remove=list(edges_to_remove))
+    edges_to_restore = list(removed_edges)
+
+    defended_data = _apply_edge_changes(
+        attacked_data, edges_to_add=edges_to_restore, edges_to_remove=edges_to_remove
+    )
     return defended_data
 
 
-def feature_smoothing_defense(attacked_data):
+def feature_smoothing_defense(attacked_data, original_data=None, alpha=0.3):
     new_data = attacked_data.clone()
-    edge_index = attacked_data.edge_index
-    num_nodes = attacked_data.num_nodes
 
+    if original_data is not None:
+        edge_index = original_data.edge_index
+    else:
+        edge_index = attacked_data.edge_index
+
+    num_nodes = attacked_data.num_nodes
     row = edge_index[0]
     col = edge_index[1]
 
@@ -464,9 +514,16 @@ def feature_smoothing_defense(attacked_data):
     row_norm = deg_inv[row]
 
     x = attacked_data.x.float()
-    smoothed = torch.zeros_like(x)
-    smoothed.index_add_(0, row, x[col] * row_norm.unsqueeze(1))
-    smoothed = (x + smoothed) / 2.0
+    smoothed_neighbor = torch.zeros_like(x)
+    smoothed_neighbor.index_add_(0, row, x[col] * row_norm.unsqueeze(1))
+
+    smoothed = (1 - alpha) * x + alpha * smoothed_neighbor
+
+    if original_data is not None:
+        orig_x = original_data.x.float()
+        diff = (x - orig_x).abs().mean(dim=-1, keepdim=True)
+        weight = torch.sigmoid(diff * 10.0)
+        smoothed = (1 - weight) * smoothed + weight * orig_x
 
     new_data.x = smoothed
     return new_data
@@ -571,7 +628,7 @@ def batch_evaluate(model, data, method, ratios, mode, device=None, defense=None,
             if defense_key == 'degree_filter':
                 defended_data = degree_filter_defense(data, attacked_data)
             elif defense_key == 'feature_smoothing':
-                defended_data = feature_smoothing_defense(attacked_data)
+                defended_data = feature_smoothing_defense(attacked_data, original_data=data)
             else:
                 defended_data = attacked_data
 

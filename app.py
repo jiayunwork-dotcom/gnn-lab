@@ -1139,7 +1139,7 @@ with tab6:
                     if defense_key == 'degree_filter':
                         defended_data = degree_filter_defense(data, attacked_data)
                     else:
-                        defended_data = feature_smoothing_defense(attacked_data)
+                        defended_data = feature_smoothing_defense(attacked_data, original_data=data)
                     acc_def, f1_def = evaluate_on_data(model, defended_data, device)
 
                 st.session_state.adv_last_result = {
@@ -1325,7 +1325,7 @@ with tab6:
                     acc_deg, f1_deg = evaluate_on_data(model, defended_deg, device)
                     defense_results['度数边过滤'] = {'acc': acc_deg, 'f1': f1_deg}
                 if def_enable_smooth:
-                    defended_smooth = feature_smoothing_defense(attacked_data)
+                    defended_smooth = feature_smoothing_defense(attacked_data, original_data=data)
                     acc_smooth, f1_smooth = evaluate_on_data(model, defended_smooth, device)
                     defense_results['特征平滑'] = {'acc': acc_smooth, 'f1': f1_smooth}
 
