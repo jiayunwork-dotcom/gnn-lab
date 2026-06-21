@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from torch_geometric.utils import to_networkx
 
 from data_loader import (
     load_builtin_dataset, load_from_csv, load_from_graphml, load_from_gml,
@@ -19,6 +22,12 @@ from trainer import (
 )
 from community_detect import (
     run_community_detection, COMMUNITY_ALGORITHMS
+)
+from adversarial import (
+    run_attack, evaluate_on_data, get_prediction_probs,
+    batch_evaluate, get_perturbed_edge_info,
+    degree_filter_defense, feature_smoothing_defense,
+    ATTACK_METHODS, ATTACK_MODES, DEFENSE_METHODS
 )
 from visualizations import (
     compute_layout, plot_degree_distribution, plot_training_curves,
@@ -335,9 +344,9 @@ with st.sidebar:
             st.session_state.selected_history_idx = None
             st.rerun()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     '📊 数据概览', '🧠 GNN训练', '🔍 社区发现',
-    '📈 可视化分析', '⚡ 对比实验'
+    '📈 可视化分析', '⚡ 对比实验', '🛡️ 对抗鲁棒性'
 ])
 
 with tab1:
@@ -1073,6 +1082,524 @@ with tab5:
                     )
                 else:
                     st.info('💡 提示：配置不同层数的实验可观察过平滑现象')
+
+with tab6:
+    st.subheader('🛡️ 图对抗鲁棒性分析')
+    if st.session_state.data is None:
+        st.info('请先在左侧加载数据集')
+    elif st.session_state.num_classes == 0:
+        st.warning('⚠️ 当前数据集无标签，无法进行鲁棒性评估')
+    elif len(st.session_state.training_history) == 0 and st.session_state.model is None:
+        st.info('请先在"GNN训练"页训练模型')
+    else:
+        available_models = []
+        if len(st.session_state.training_history) > 0:
+            for i, rec in enumerate(st.session_state.training_history):
+                available_models.append(f'{rec["model_name"]} · {rec["timestamp"]} (精度:{rec["test_acc"]:.4f})')
+        if st.session_state.model is not None and st.session_state.results is not None:
+            available_models.insert(0, '当前模型')
+
+        adv_tabs = st.tabs(['🎯 单次攻击评估', '📊 批量评估', '⚔️ 防御策略对比', '👁️ 攻击可视化', '💾 结果导出'])
+
+        with adv_tabs[0]:
+            st.markdown('#### 单次攻击评估')
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                selected_model_label = st.selectbox('选择模型', available_models, key='adv_model')
+                attack_method = st.selectbox('攻击方法', list(ATTACK_METHODS.keys()), key='adv_method')
+            with sc2:
+                attack_ratio = st.slider('攻击比例(%)', 1, 50, 10, 1, key='adv_ratio',
+                                         format='%d%%')
+                attack_mode = st.selectbox('攻击模式', list(ATTACK_MODES.keys()), key='adv_mode')
+            with sc3:
+                enable_defense = st.checkbox('启用防御', value=False, key='adv_enable_def')
+                defense_method = None
+                if enable_defense:
+                    defense_method = st.selectbox('防御方法', list(DEFENSE_METHODS.keys()), key='adv_defense')
+
+            if st.button('🚀 执行攻击', type='primary', use_container_width=True, key='btn_adv_attack'):
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model = st.session_state.model
+
+                data = st.session_state.data
+                ratio = attack_ratio / 100.0
+
+                with st.spinner('执行攻击中...'):
+                    attacked_data = run_attack(
+                        data, model, attack_method, ratio, attack_mode, device=device
+                    )
+
+                acc_before, f1_before = evaluate_on_data(model, data, device)
+                acc_after, f1_after = evaluate_on_data(model, attacked_data, device)
+
+                acc_def = None
+                f1_def = None
+                if enable_defense and defense_method is not None:
+                    defense_key = DEFENSE_METHODS.get(defense_method, defense_method)
+                    if defense_key == 'degree_filter':
+                        defended_data = degree_filter_defense(data, attacked_data)
+                    else:
+                        defended_data = feature_smoothing_defense(attacked_data)
+                    acc_def, f1_def = evaluate_on_data(model, defended_data, device)
+
+                st.session_state.adv_last_result = {
+                    'attack_method': attack_method,
+                    'attack_ratio': attack_ratio,
+                    'attack_mode': attack_mode,
+                    'acc_before': acc_before,
+                    'acc_after': acc_after,
+                    'acc_drop': acc_before - acc_after,
+                    'f1_before': f1_before,
+                    'f1_after': f1_after,
+                    'f1_drop': f1_before - f1_after,
+                    'defense_method': defense_method if enable_defense else None,
+                    'acc_after_defense': acc_def,
+                    'f1_after_defense': f1_def,
+                    'attacked_data': attacked_data,
+                }
+
+                st.success('✅ 攻击评估完成！')
+
+            if 'adv_last_result' in st.session_state and st.session_state.adv_last_result is not None:
+                res = st.session_state.adv_last_result
+                st.markdown('---')
+                st.markdown('#### 📊 攻击结果')
+
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric('攻击前精度', f'{res["acc_before"]:.4f}')
+                rc2.metric('攻击后精度', f'{res["acc_after"]:.4f}',
+                           f'↓ {res["acc_drop"]:.4f}', delta_color='inverse')
+                rc3.metric('攻击前F1', f'{res["f1_before"]:.4f}')
+                rc4.metric('攻击后F1', f'{res["f1_after"]:.4f}',
+                           f'↓ {res["f1_drop"]:.4f}', delta_color='inverse')
+
+                if res['defense_method'] is not None and res['acc_after_defense'] is not None:
+                    st.markdown('##### 🛡️ 防御效果')
+                    dc1, dc2, dc3 = st.columns(3)
+                    dc1.metric('防御方法', res['defense_method'])
+                    dc2.metric('防御后精度', f'{res["acc_after_defense"]:.4f}',
+                               f'↑ {res["acc_after_defense"] - res["acc_after"]:.4f}')
+                    dc3.metric('防御后F1', f'{res["f1_after_defense"]:.4f}',
+                               f'↑ {res["f1_after_defense"] - res["f1_after"]:.4f}')
+
+                if 'adv_batch_results' not in st.session_state:
+                    st.session_state.adv_batch_results = []
+                st.session_state.adv_batch_results.append(res)
+
+        with adv_tabs[1]:
+            st.markdown('#### 批量攻击评估')
+            bc1, bc2 = st.columns(2)
+            with bc1:
+                batch_method = st.selectbox('攻击方法', list(ATTACK_METHODS.keys()), key='batch_method')
+                batch_mode = st.selectbox('攻击模式', list(ATTACK_MODES.keys()), key='batch_mode')
+            with bc2:
+                batch_ratios_str = st.text_input(
+                    '攻击比例列表(%, 逗号分隔)',
+                    '5,10,15,20,25',
+                    key='batch_ratios'
+                )
+                batch_defense = st.checkbox('启用防御', value=False, key='batch_enable_def')
+                batch_defense_method = None
+                if batch_defense:
+                    batch_defense_method = st.selectbox(
+                        '防御方法', list(DEFENSE_METHODS.keys()), key='batch_defense'
+                    )
+
+            if st.button('📊 一键批量评估', type='primary', use_container_width=True, key='btn_batch_adv'):
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model = st.session_state.model
+                data = st.session_state.data
+
+                try:
+                    ratios_pct = [float(x.strip()) for x in batch_ratios_str.split(',')]
+                    ratios = [r / 100.0 for r in ratios_pct]
+                except ValueError:
+                    st.error('请输入有效的逗号分隔数字')
+                    ratios = []
+
+                if len(ratios) > 0:
+                    with st.spinner('批量评估中...'):
+                        batch_results = batch_evaluate(
+                            model, data, batch_method, ratios, batch_mode,
+                            device=device,
+                            defense=batch_defense_method if batch_defense else None
+                        )
+
+                    st.session_state.adv_batch_results = batch_results
+                    st.success('✅ 批量评估完成！')
+
+            if 'adv_batch_results' in st.session_state and len(st.session_state.adv_batch_results) > 0:
+                batch_res = st.session_state.adv_batch_results
+                valid_ratios = [r for r in batch_res if isinstance(r.get('attack_ratio'), (int, float))]
+                if len(valid_ratios) > 0:
+                    ratios_x = [r['attack_ratio'] * 100 if r['attack_ratio'] <= 1 else r['attack_ratio']
+                                for r in valid_ratios]
+                    acc_drops = [r['acc_drop'] for r in valid_ratios]
+                    f1_drops = [r['f1_drop'] for r in valid_ratios]
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=ratios_x, y=acc_drops, mode='lines+markers',
+                        name='精度下降', line=dict(color='#EF553B', width=2),
+                        marker=dict(size=8)
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=ratios_x, y=f1_drops, mode='lines+markers',
+                        name='F1下降', line=dict(color='#636EFA', width=2, dash='dash'),
+                        marker=dict(size=8)
+                    ))
+
+                    has_defense = any(r.get('acc_after_defense') is not None for r in valid_ratios)
+                    if has_defense:
+                        defense_drops = []
+                        for r in valid_ratios:
+                            if r.get('acc_after_defense') is not None:
+                                defense_drops.append(r['acc_before'] - r['acc_after_defense'])
+                            else:
+                                defense_drops.append(None)
+                        fig.add_trace(go.Scatter(
+                            x=ratios_x, y=defense_drops, mode='lines+markers',
+                            name='精度下降(有防御)', line=dict(color='#00CC96', width=2),
+                            marker=dict(size=8, symbol='diamond')
+                        ))
+
+                    fig.update_layout(
+                        title='攻击比例 vs 精度/F1下降幅度',
+                        xaxis_title='攻击比例 (%)',
+                        yaxis_title='下降幅度',
+                        template='plotly_white',
+                        height=450,
+                        legend=dict(orientation='h', yanchor='bottom', y=-0.25,
+                                    xanchor='center', x=0.5),
+                        margin=dict(l=50, r=20, t=50, b=80)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown('#### 📋 批量评估结果表')
+                    table_rows = []
+                    for r in valid_ratios:
+                        row = {
+                            '攻击比例': f'{r["attack_ratio"]*100:.0f}%' if r['attack_ratio'] <= 1 else f'{r["attack_ratio"]:.0f}%',
+                            '攻击前精度': f'{r["acc_before"]:.4f}',
+                            '攻击后精度': f'{r["acc_after"]:.4f}',
+                            '精度下降': f'{r["acc_drop"]:.4f}',
+                            '攻击前F1': f'{r["f1_before"]:.4f}',
+                            '攻击后F1': f'{r["f1_after"]:.4f}',
+                            'F1下降': f'{r["f1_drop"]:.4f}',
+                        }
+                        if r.get('acc_after_defense') is not None:
+                            row['防御后精度'] = f'{r["acc_after_defense"]:.4f}'
+                            row['防御后F1'] = f'{r["f1_after_defense"]:.4f}'
+                        table_rows.append(row)
+                    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+        with adv_tabs[2]:
+            st.markdown('#### 防御策略对比')
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                def_attack_method = st.selectbox('攻击方法', list(ATTACK_METHODS.keys()), key='def_method')
+                def_attack_ratio = st.slider('攻击比例(%)', 1, 50, 15, 1, key='def_ratio')
+                def_attack_mode = st.selectbox('攻击模式', list(ATTACK_MODES.keys()), key='def_mode')
+            with dc2:
+                def_enable_deg = st.checkbox('度数边过滤', value=True, key='def_deg')
+                def_enable_smooth = st.checkbox('特征平滑', value=True, key='def_smooth')
+                def_deg_percentile = st.slider('度数过滤百分位', 80, 99, 95, 1, key='def_deg_pct')
+
+            if st.button('⚔️ 执行防御对比', type='primary', use_container_width=True, key='btn_def_compare'):
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                model = st.session_state.model
+                data = st.session_state.data
+                ratio = def_attack_ratio / 100.0
+
+                with st.spinner('执行攻击...'):
+                    attacked_data = run_attack(
+                        data, model, def_attack_method, ratio, def_attack_mode, device=device
+                    )
+
+                acc_before, f1_before = evaluate_on_data(model, data, device)
+                acc_after, f1_after = evaluate_on_data(model, attacked_data, device)
+
+                defense_results = {}
+                if def_enable_deg:
+                    defended_deg = degree_filter_defense(data, attacked_data, threshold_percentile=def_deg_percentile)
+                    acc_deg, f1_deg = evaluate_on_data(model, defended_deg, device)
+                    defense_results['度数边过滤'] = {'acc': acc_deg, 'f1': f1_deg}
+                if def_enable_smooth:
+                    defended_smooth = feature_smoothing_defense(attacked_data)
+                    acc_smooth, f1_smooth = evaluate_on_data(model, defended_smooth, device)
+                    defense_results['特征平滑'] = {'acc': acc_smooth, 'f1': f1_smooth}
+
+                st.session_state.adv_defense_result = {
+                    'acc_before': acc_before,
+                    'f1_before': f1_before,
+                    'acc_after': acc_after,
+                    'f1_after': f1_after,
+                    'defense_results': defense_results,
+                }
+                st.success('✅ 防御对比完成！')
+
+            if 'adv_defense_result' in st.session_state and st.session_state.adv_defense_result is not None:
+                dres = st.session_state.adv_defense_result
+
+                st.markdown('---')
+                m1, m2 = st.columns(2)
+                m1.metric('原始精度', f'{dres["acc_before"]:.4f}')
+                m2.metric('攻击后精度(无防御)', f'{dres["acc_after"]:.4f}',
+                          f'↓ {dres["acc_before"] - dres["acc_after"]:.4f}', delta_color='inverse')
+
+                if len(dres['defense_results']) > 0:
+                    categories = ['原始', '攻击后(无防御)']
+                    acc_vals = [dres['acc_before'], dres['acc_after']]
+                    f1_vals = [dres['f1_before'], dres['f1_after']]
+                    bar_colors = ['#636EFA', '#EF553B']
+
+                    for def_name, def_res in dres['defense_results'].items():
+                        categories.append(f'攻击后+{def_name}')
+                        acc_vals.append(def_res['acc'])
+                        f1_vals.append(def_res['f1'])
+                        bar_colors.append('#00CC96' if '度数' in def_name else '#AB63FA')
+
+                    fig = make_subplots(rows=1, cols=2, subplot_titles=('精度对比', 'F1对比'))
+                    fig.add_trace(go.Bar(
+                        x=categories, y=acc_vals, marker_color=bar_colors,
+                        text=[f'{v:.4f}' for v in acc_vals], textposition='auto',
+                        name='Accuracy'
+                    ), row=1, col=1)
+                    fig.add_trace(go.Bar(
+                        x=categories, y=f1_vals, marker_color=bar_colors,
+                        text=[f'{v:.4f}' for v in f1_vals], textposition='auto',
+                        name='F1'
+                    ), row=1, col=2)
+                    fig.update_layout(
+                        template='plotly_white', height=420, showlegend=False,
+                        margin=dict(l=40, r=20, t=60, b=100),
+                        xaxis_tickangle=-20,
+                    )
+                    fig.update_xaxes(tickangle=-20, row=1, col=1)
+                    fig.update_xaxes(tickangle=-20, row=1, col=2)
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with adv_tabs[3]:
+            st.markdown('#### 攻击可视化')
+            if 'adv_last_result' not in st.session_state or st.session_state.adv_last_result is None:
+                st.info('请先在"单次攻击评估"或"批量评估"中执行攻击')
+            else:
+                last_res = st.session_state.adv_last_result
+                attacked_data = last_res.get('attacked_data')
+                if attacked_data is None:
+                    st.info('未找到攻击后的图数据，请重新执行攻击')
+                else:
+                    data = st.session_state.data
+                    model = st.session_state.model
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+                    added, removed, affected_nodes = get_perturbed_edge_info(data, attacked_data)
+
+                    st.markdown(f'**扰动统计**: 添加 {len(added)} 条边, 删除 {len(removed)} 条边, 受影响节点 {len(affected_nodes)} 个')
+
+                    vc1, vc2 = st.columns(2)
+                    with vc1:
+                        has_labels = st.session_state.num_classes > 0
+                        colors_orig = None
+                        if has_labels and data.y is not None:
+                            colors_orig = data.y.cpu().numpy().tolist()
+                        fig_orig = plot_graph(
+                            st.session_state.G, pos=st.session_state.pos,
+                            node_colors=colors_orig,
+                            class_names=st.session_state.class_names,
+                            color_theme=st.session_state.color_theme,
+                            title='原始图（按真实标签着色）'
+                        )
+                        st.plotly_chart(fig_orig, use_container_width=True)
+
+                    with vc2:
+                        G_attacked = to_networkx(attacked_data, to_undirected=True)
+                        try:
+                            pos_attacked = compute_layout(G_attacked, layout='spring', seed=42)
+                        except Exception:
+                            pos_attacked = st.session_state.pos
+
+                        has_labels = st.session_state.num_classes > 0
+                        colors_att = None
+                        if has_labels and data.y is not None:
+                            colors_att = data.y.cpu().numpy().tolist()
+
+                        edge_traces = []
+                        perturbed_edge_set = added | removed
+
+                        for u, v in G_attacked.edges():
+                            x0, y0 = pos_attacked.get(u, (0, 0))
+                            x1, y1 = pos_attacked.get(v, (0, 0))
+                            key = (min(u, v), max(u, v))
+                            is_perturbed = key in perturbed_edge_set
+                            ec = '#FF0000' if is_perturbed else 'rgba(150, 150, 150, 0.4)'
+                            ew = 2.5 if is_perturbed else 0.8
+
+                            edge_traces.append(go.Scatter(
+                                x=[x0, x1, None], y=[y0, y1, None],
+                                mode='lines',
+                                line=dict(width=ew, color=ec),
+                                hoverinfo='none',
+                                showlegend=False
+                            ))
+
+                        node_x = [pos_attacked.get(n, (0, 0))[0] for n in G_attacked.nodes()]
+                        node_y = [pos_attacked.get(n, (0, 0))[1] for n in G_attacked.nodes()]
+
+                        normal_nodes_x, normal_nodes_y, normal_colors = [], [], []
+                        affected_nodes_x, affected_nodes_y, affected_colors = [], [], []
+
+                        for idx_n, n in enumerate(G_attacked.nodes()):
+                            px, py = pos_attacked.get(n, (0, 0))
+                            c = colors_att[idx_n] if colors_att and idx_n < len(colors_att) else 0
+                            if n in affected_nodes:
+                                affected_nodes_x.append(px)
+                                affected_nodes_y.append(py)
+                                affected_colors.append(c)
+                            else:
+                                normal_nodes_x.append(px)
+                                normal_nodes_y.append(py)
+                                normal_colors.append(c)
+
+                        theme = COLOR_THEMES.get(st.session_state.color_theme, COLOR_THEMES['Plotly默认'])
+                        color_scale = theme['color_scale']
+
+                        if normal_nodes_x:
+                            edge_traces.append(go.Scatter(
+                                x=normal_nodes_x, y=normal_nodes_y,
+                                mode='markers',
+                                marker=dict(
+                                    size=10, colorscale=color_scale,
+                                    color=normal_colors, line_width=1, line_color='white',
+                                    showscale=True,
+                                    colorbar=dict(thickness=15, title=dict(text='类别', side='right'), xanchor='left')
+                                ),
+                                hoverinfo='text',
+                                hovertext=[f'节点{n}' for n in G_attacked.nodes() if n not in affected_nodes],
+                                showlegend=False,
+                                name='正常节点'
+                            ))
+
+                        if affected_nodes_x:
+                            edge_traces.append(go.Scatter(
+                                x=affected_nodes_x, y=affected_nodes_y,
+                                mode='markers',
+                                marker=dict(
+                                    size=14, colorscale=color_scale,
+                                    color=affected_colors, symbol='triangle-up',
+                                    line_width=2, line_color='red',
+                                    showscale=False
+                                ),
+                                hoverinfo='text',
+                                hovertext=[f'受影响节点{n}' for n in affected_nodes],
+                                showlegend=False,
+                                name='受影响节点'
+                            ))
+
+                        fig_att = go.Figure(data=edge_traces)
+                        fig_att.update_layout(
+                            title='攻击后的图（红色=被扰动边，三角形=受影响节点）',
+                            template=theme['template'],
+                            height=550, showlegend=False, hovermode='closest',
+                            margin=dict(l=5, r=5, t=50, b=5),
+                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
+                        )
+                        st.plotly_chart(fig_att, use_container_width=True)
+
+                    st.markdown('---')
+                    st.markdown('#### 节点级影响热力图')
+                    try:
+                        probs_before = get_prediction_probs(model, data, device)
+                        probs_after = get_prediction_probs(model, attacked_data, device)
+                        prob_change = np.abs(probs_after - probs_before)
+                        max_change = prob_change.max(axis=1)
+
+                        num_nodes = len(max_change)
+                        sample_size = min(200, num_nodes)
+                        if num_nodes > 200:
+                            sample_indices = np.linspace(0, num_nodes - 1, sample_size, dtype=int)
+                            sample_change = max_change[sample_indices]
+                            sample_ids = sample_indices
+                        else:
+                            sample_change = max_change
+                            sample_ids = np.arange(num_nodes)
+
+                        heatmap_fig = go.Figure(data=go.Heatmap(
+                            z=prob_change[sample_ids].T,
+                            x=[f'{i}' for i in sample_ids],
+                            y=[f'类{c}' for c in range(prob_change.shape[1])],
+                            colorscale='Reds',
+                            colorbar=dict(title='概率变化'),
+                        ))
+                        heatmap_fig.update_layout(
+                            title='节点级预测概率变化热力图',
+                            xaxis_title='节点ID',
+                            yaxis_title='类别',
+                            template='plotly_white',
+                            height=350,
+                            margin=dict(l=60, r=20, t=50, b=60)
+                        )
+                        st.plotly_chart(heatmap_fig, use_container_width=True)
+
+                        top_k = 10
+                        top_indices = np.argsort(max_change)[-top_k:][::-1]
+                        st.markdown(f'##### 受影响最大的 {top_k} 个节点')
+                        top_data = []
+                        for idx_n in top_indices:
+                            pred_before = int(probs_before[idx_n].argmax())
+                            pred_after = int(probs_after[idx_n].argmax())
+                            top_data.append({
+                                '节点ID': int(idx_n),
+                                '攻击前预测类别': pred_before,
+                                '攻击后预测类别': pred_after,
+                                '是否改变预测': '是' if pred_before != pred_after else '否',
+                                '最大概率变化': f'{max_change[idx_n]:.4f}',
+                            })
+                        st.dataframe(pd.DataFrame(top_data), use_container_width=True, hide_index=True)
+                    except Exception as e:
+                        st.warning(f'热力图生成失败: {str(e)}')
+
+        with adv_tabs[4]:
+            st.markdown('#### 结果导出')
+            if 'adv_batch_results' not in st.session_state or len(st.session_state.adv_batch_results) == 0:
+                st.info('暂无评估结果，请先执行攻击评估')
+            else:
+                export_rows = []
+                for r in st.session_state.adv_batch_results:
+                    if not isinstance(r.get('attack_ratio'), (int, float)):
+                        continue
+                    ratio_display = f'{r["attack_ratio"]*100:.0f}%' if r['attack_ratio'] <= 1 else f'{r["attack_ratio"]:.0f}%'
+                    row = {
+                        '攻击方法': r.get('attack_method', ''),
+                        '攻击比例': ratio_display,
+                        '攻击模式': r.get('attack_mode', ''),
+                        '攻击前精度': round(r['acc_before'], 4),
+                        '攻击后精度': round(r['acc_after'], 4),
+                        '精度变化': round(r['acc_drop'], 4),
+                        '攻击前F1': round(r['f1_before'], 4),
+                        '攻击后F1': round(r['f1_after'], 4),
+                        'F1变化': round(r['f1_drop'], 4),
+                    }
+                    if r.get('defense_method') is not None:
+                        row['防御方法'] = r['defense_method']
+                        if r.get('acc_after_defense') is not None:
+                            row['防御后精度'] = round(r['acc_after_defense'], 4)
+                            row['防御后F1'] = round(r.get('f1_after_defense', 0), 4)
+                    export_rows.append(row)
+
+                if len(export_rows) > 0:
+                    export_df = pd.DataFrame(export_rows)
+                    st.dataframe(export_df, use_container_width=True, hide_index=True)
+
+                    csv_bytes = export_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        '💾 导出攻击实验结果(CSV)',
+                        csv_bytes,
+                        'adversarial_results.csv',
+                        'text/csv',
+                        use_container_width=True
+                    )
 
 st.markdown('---')
 st.caption('GNN实验平台 v1.0 · PyTorch Geometric + Streamlit + NetworkX + Plotly')
