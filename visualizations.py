@@ -177,9 +177,8 @@ def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None
             line_color='white',
             colorbar=dict(
                 thickness=15,
-                title='类别/社区',
-                xanchor='left',
-                titleside='right'
+                title=dict(text='类别/社区', side='right'),
+                xanchor='left'
             )
         ),
         hovertext=text_labels
