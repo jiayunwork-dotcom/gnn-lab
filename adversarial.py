@@ -120,6 +120,32 @@ def _select_edges_to_add(data, num_edges, priority_scores=None):
         return [non_existing[i] for i in indices]
 
 
+def _get_target_nodes(data):
+    if hasattr(data, 'test_mask') and data.test_mask is not None and data.test_mask.sum() > 0:
+        return set(torch.where(data.test_mask)[0].tolist())
+    if hasattr(data, 'val_mask') and data.val_mask is not None and data.val_mask.sum() > 0:
+        return set(torch.where(data.val_mask)[0].tolist())
+    if hasattr(data, 'train_mask') and data.train_mask is not None and data.train_mask.sum() > 0:
+        return set(torch.where(data.train_mask)[0].tolist())
+    return set(range(data.num_nodes))
+
+
+def _get_1hop_of_target(data):
+    target_nodes = _get_target_nodes(data)
+    if len(target_nodes) == 0:
+        return set(range(data.num_nodes))
+    edge_index = data.edge_index
+    neighbors = set(target_nodes)
+    for i in range(edge_index.shape[1]):
+        u = int(edge_index[0, i])
+        v = int(edge_index[1, i])
+        if u in target_nodes:
+            neighbors.add(v)
+        if v in target_nodes:
+            neighbors.add(u)
+    return neighbors
+
+
 def random_attack(data, ratio, mode='flip', seed=None):
     if seed is not None:
         np.random.seed(seed)
@@ -127,17 +153,81 @@ def random_attack(data, ratio, mode='flip', seed=None):
     num_total_edges = data.edge_index.shape[1] // 2
     num_perturb = max(1, int(num_total_edges * ratio))
 
+    target_nodes = _get_target_nodes(data)
+    target_1hop = _get_1hop_of_target(data)
+    labels = data.y.cpu().numpy() if data.y is not None else None
+
+    def _weighted_sample_edges(edges, num_select, target_nodes, target_1hop, labels, for_adding=True):
+        if len(edges) == 0:
+            return []
+        weights = []
+        for u, v in edges:
+            w = 1.0
+            u_is_t = u in target_nodes
+            v_is_t = v in target_nodes
+            u_in_h = u in target_1hop
+            v_in_h = v in target_1hop
+
+            if for_adding and labels is not None:
+                lab_u = int(labels[u])
+                lab_v = int(labels[v])
+                if lab_u != lab_v:
+                    if u_is_t and v_is_t:
+                        w = 1000.0
+                    elif u_is_t or v_is_t:
+                        w = 500.0
+                    elif u_in_h and v_in_h:
+                        w = 50.0
+                    else:
+                        w = 5.0
+                else:
+                    if u_is_t and v_is_t:
+                        w = 100.0
+                    elif u_is_t or v_is_t:
+                        w = 80.0
+                    elif u_in_h and v_in_h:
+                        w = 15.0
+                    else:
+                        w = 0.5
+            else:
+                if u_is_t and v_is_t:
+                    w = 100.0
+                elif u_is_t or v_is_t:
+                    w = 80.0
+                elif u_in_h and v_in_h:
+                    w = 15.0
+                else:
+                    w = 0.5
+
+            weights.append(w)
+
+        weights = np.array(weights, dtype=np.float64)
+        weights = weights / weights.sum()
+        n = min(num_select, len(edges))
+        indices = np.random.choice(len(edges), size=n, replace=False, p=weights)
+        return [edges[i] for i in indices]
+
+    existing = _get_existing_edges(data)
+    existing_list = list(existing)
+
+    num_nodes = data.num_nodes
+    non_existing = []
+    for u in range(num_nodes):
+        for v in range(u + 1, num_nodes):
+            if (u, v) not in existing:
+                non_existing.append((u, v))
+
     if mode == 'add':
-        edges = _select_edges_to_add(data, num_perturb)
+        edges = _weighted_sample_edges(non_existing, num_perturb, target_nodes, target_1hop, labels, for_adding=True)
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
-        edges = _select_edges_to_remove(data, num_perturb)
+        edges = _weighted_sample_edges(existing_list, num_perturb, target_nodes, target_1hop, labels, for_adding=False)
         return _apply_edge_changes(data, edges_to_add=[], edges_to_remove=edges)
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
-        edges_add = _select_edges_to_add(data, n_add)
-        edges_remove = _select_edges_to_remove(data, n_remove)
+        edges_add = _weighted_sample_edges(non_existing, n_add, target_nodes, target_1hop, labels, for_adding=True)
+        edges_remove = _weighted_sample_edges(existing_list, n_remove, target_nodes, target_1hop, labels, for_adding=False)
         return _apply_edge_changes(data, edges_to_add=edges_add, edges_to_remove=edges_remove)
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -154,20 +244,64 @@ def degree_attack(data, ratio, mode='flip'):
         degree_scores[edge_index[0, i]] += 1
     degree_scores = degree_scores.numpy()
 
+    target_nodes = _get_target_nodes(data)
+    target_1hop = _get_1hop_of_target(data)
+    labels = data.y.cpu().numpy() if data.y is not None else None
+
+    def _attack_score(u, v):
+        base_deg = max(degree_scores[u], degree_scores[v])
+        min_deg = min(degree_scores[u], degree_scores[v])
+        deg_component = base_deg + min_deg * 0.3
+
+        u_is_t = u in target_nodes
+        v_is_t = v in target_nodes
+        u_in_h = u in target_1hop
+        v_in_h = v in target_1hop
+
+        label_component = 0.0
+        if labels is not None:
+            lu = int(labels[u])
+            lv = int(labels[v])
+            cross_label = lu != lv
+        else:
+            cross_label = False
+
+        if u_is_t and v_is_t:
+            if cross_label:
+                label_component = 1.0e7
+            else:
+                label_component = 1.0e5 / max(max(degree_scores[u], degree_scores[v]), 1)
+        elif u_is_t or v_is_t:
+            tn = u if u_is_t else v
+            tn_deg = degree_scores[tn]
+            if cross_label:
+                label_component = 1.0e6 / max(tn_deg, 1)
+            else:
+                label_component = 1.0e4 / max(tn_deg, 1)
+        elif u_in_h and v_in_h:
+            if cross_label:
+                label_component = 1.0e3 / max(max(degree_scores[u], degree_scores[v]), 1)
+            else:
+                label_component = 10.0 / max(max(degree_scores[u], degree_scores[v]), 1)
+        elif u_in_h or v_in_h:
+            label_component = 1.0 / max(min_deg, 1)
+        else:
+            label_component = 0.0001
+
+        return label_component + deg_component * 0.000001
+
     edge_priority = {}
-    for i in range(edge_index.shape[1]):
-        u = int(edge_index[0, i])
-        v = int(edge_index[1, i])
-        key = (min(u, v), max(u, v))
-        edge_priority[key] = max(degree_scores[u], degree_scores[v])
+    existing = _get_existing_edges(data)
+    for u, v in existing:
+        edge_priority[(u, v)] = _attack_score(u, v)
+
+    add_priority = {}
+    for u in range(num_nodes):
+        for v in range(u + 1, num_nodes):
+            if (u, v) not in existing:
+                add_priority[(u, v)] = _attack_score(u, v)
 
     if mode == 'add':
-        add_priority = {}
-        existing = _get_existing_edges(data)
-        for u in range(num_nodes):
-            for v in range(u + 1, num_nodes):
-                if (u, v) not in existing:
-                    add_priority[(u, v)] = max(degree_scores[u], degree_scores[v])
         edges = _select_edges_to_add(data, num_perturb, priority_scores=add_priority)
         return _apply_edge_changes(data, edges_to_add=edges, edges_to_remove=[])
     elif mode == 'remove':
@@ -176,14 +310,6 @@ def degree_attack(data, ratio, mode='flip'):
     elif mode == 'flip':
         n_add = num_perturb // 2
         n_remove = num_perturb - n_add
-
-        add_priority = {}
-        existing = _get_existing_edges(data)
-        for u in range(num_nodes):
-            for v in range(u + 1, num_nodes):
-                if (u, v) not in existing:
-                    add_priority[(u, v)] = max(degree_scores[u], degree_scores[v])
-
         edges_add = _select_edges_to_add(data, n_add, priority_scores=add_priority)
         edges_remove = _select_edges_to_remove(data, n_remove, priority_scores=edge_priority)
         return _apply_edge_changes(data, edges_to_add=edges_add, edges_to_remove=edges_remove)

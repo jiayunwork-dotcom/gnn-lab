@@ -1526,32 +1526,51 @@ with tab6:
                         sample_size = min(200, num_nodes)
                         if num_nodes > 200:
                             sample_indices = np.linspace(0, num_nodes - 1, sample_size, dtype=int)
-                            sample_change = max_change[sample_indices]
+                            sample_change_mat = prob_change[sample_indices].T
                             sample_ids = sample_indices
                         else:
-                            sample_change = max_change
+                            sample_change_mat = prob_change.T
                             sample_ids = np.arange(num_nodes)
 
+                        z_max = float(prob_change.max())
+                        if z_max < 1e-6:
+                            z_max = 0.01
+
                         heatmap_fig = go.Figure(data=go.Heatmap(
-                            z=prob_change[sample_ids].T,
+                            z=sample_change_mat,
                             x=[f'{i}' for i in sample_ids],
                             y=[f'类{c}' for c in range(prob_change.shape[1])],
-                            colorscale='Reds',
-                            colorbar=dict(title='概率变化'),
+                            colorscale=[
+                                [0.0, '#FFF5F5'],
+                                [0.15, '#FFD6D6'],
+                                [0.3, '#FF9999'],
+                                [0.5, '#FF5555'],
+                                [0.7, '#E02020'],
+                                [0.85, '#B00000'],
+                                [1.0, '#700000']
+                            ],
+                            zmin=0.0,
+                            zmax=z_max,
+                            colorbar=dict(
+                                title=dict(text='预测概率变化值', side='right'),
+                                thickness=18,
+                                tickformat='.3f'
+                            ),
                         ))
                         heatmap_fig.update_layout(
-                            title='节点级预测概率变化热力图',
+                            title='节点级预测概率变化热力图（纵轴=类别，颜色深浅=受影响程度）',
                             xaxis_title='节点ID',
                             yaxis_title='类别',
                             template='plotly_white',
                             height=350,
-                            margin=dict(l=60, r=20, t=50, b=60)
+                            margin=dict(l=60, r=30, t=70, b=80)
                         )
                         st.plotly_chart(heatmap_fig, use_container_width=True)
 
-                        top_k = 10
-                        top_indices = np.argsort(max_change)[-top_k:][::-1]
-                        st.markdown(f'##### 受影响最大的 {top_k} 个节点')
+                        sort_idx = np.argsort(-max_change)
+                        top_k = min(10, num_nodes)
+                        top_indices = sort_idx[:top_k]
+                        st.markdown(f'##### 受影响最大的 {top_k} 个节点（按概率变化幅度排序）')
                         top_data = []
                         for idx_n in top_indices:
                             pred_before = int(probs_before[idx_n].argmax())
