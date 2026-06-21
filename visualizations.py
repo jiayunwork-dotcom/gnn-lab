@@ -6,6 +6,41 @@ import plotly.figure_factory as ff
 from plotly.subplots import make_subplots
 
 
+COLOR_THEMES = {
+    'Plotly默认': {
+        'colors': ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
+                   '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'],
+        'color_scale': 'Plotly3',
+        'edge_color': 'rgba(150, 150, 150, 0.6)',
+        'template': 'plotly_white',
+    },
+    '学术论文风格': {
+        'colors': ['#1f497d', '#4f81bd', '#9cb4d8', '#c5d9f1', '#366092',
+                   '#2d5a87', '#6d9dd3', '#8db4e2', '#b6cff0', '#dbe9f7'],
+        'color_scale': 'Blues',
+        'edge_color': 'rgba(150, 150, 150, 0.5)',
+        'template': 'plotly_white',
+    },
+    '高对比度无障碍': {
+        'colors': ['#000000', '#E69F00', '#56B4E9', '#009E73', '#F0E442',
+                   '#0072B2', '#D55E00', '#CC79A7', '#000000', '#E69F00'],
+        'color_scale': 'Viridis',
+        'edge_color': 'rgba(100, 100, 100, 0.8)',
+        'template': 'plotly_white',
+    },
+}
+
+
+def get_theme_colors(theme_name):
+    theme = COLOR_THEMES.get(theme_name, COLOR_THEMES['Plotly默认'])
+    return theme['colors']
+
+
+def get_theme_color_scale(theme_name):
+    theme = COLOR_THEMES.get(theme_name, COLOR_THEMES['Plotly默认'])
+    return theme['color_scale']
+
+
 def compute_layout(G, layout='spring', seed=42, k=None, iterations=50, scale=10):
     if G.number_of_nodes() == 0:
         return {}
@@ -105,12 +140,17 @@ def plot_confusion_matrix(cm, class_names=None):
 
 def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None,
                title='图可视化', layout='spring', class_names=None, show_labels=False,
-               node_ids=None, max_nodes=500):
+               node_ids=None, max_nodes=500, highlight_node=None, color_theme='Plotly默认'):
     if G.number_of_nodes() == 0:
         return go.Figure()
 
     if pos is None:
         pos = compute_layout(G, layout=layout)
+
+    theme = COLOR_THEMES.get(color_theme, COLOR_THEMES['Plotly默认'])
+    edge_color = theme['edge_color']
+    color_scale = theme['color_scale']
+    template = theme['template']
 
     if node_colors is None:
         node_colors = [0] * G.number_of_nodes()
@@ -134,10 +174,14 @@ def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None
         elif 'weight' in data:
             w = max(0.5, min(6.0, data['weight'] * 2))
 
+        is_highlight_edge = highlight_node is not None and (u == highlight_node or v == highlight_node)
+        ec = '#FF4D4D' if is_highlight_edge else edge_color
+        ew = w * 2 if is_highlight_edge else w
+
         edge_traces.append(go.Scatter(
             x=[x0, x1, None], y=[y0, y1, None],
             mode='lines',
-            line=dict(width=w, color='rgba(150, 150, 150, 0.6)'),
+            line=dict(width=ew, color=ec),
             hoverinfo='none',
             showlegend=False
         ))
@@ -156,9 +200,8 @@ def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None
         text_labels.append(lbl)
 
     unique_colors = sorted(set(node_colors)) if len(node_colors) > 0 else [0]
-    color_scale = 'Viridis'
     if class_names is not None and len(class_names) > 0:
-        color_scale = 'Plotly3'
+        pass
 
     node_trace = go.Scatter(
         x=node_x, y=node_y,
@@ -184,10 +227,31 @@ def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None
         hovertext=text_labels
     )
 
-    fig = go.Figure(data=edge_traces + [node_trace])
+    all_traces = edge_traces + [node_trace]
+
+    if highlight_node is not None and highlight_node in G.nodes():
+        hx, hy = pos[highlight_node]
+        h_idx = list(G.nodes()).index(highlight_node)
+        h_size = node_sizes[h_idx] * 1.8 if h_idx < len(node_sizes) else 30
+        highlight_trace = go.Scatter(
+            x=[hx], y=[hy],
+            mode='markers',
+            hoverinfo='text',
+            marker=dict(
+                size=h_size,
+                color='rgba(255, 77, 77, 0.9)',
+                line_width=3,
+                line_color='#FFD700',
+            ),
+            hovertext=[f'⭐ 选中节点: {highlight_node}<br>度: {degrees.get(highlight_node, 0)}'],
+            showlegend=False,
+        )
+        all_traces.append(highlight_trace)
+
+    fig = go.Figure(data=all_traces)
     fig.update_layout(
         title=title,
-        template='plotly_white',
+        template=template,
         height=550,
         showlegend=False,
         hovermode='closest',
@@ -198,17 +262,20 @@ def plot_graph(G, pos=None, node_colors=None, node_sizes=None, edge_weights=None
     return fig
 
 
-def plot_embeddings_2d(embeddings_2d, labels=None, title='节点嵌入降维可视化', class_names=None):
+def plot_embeddings_2d(embeddings_2d, labels=None, title='节点嵌入降维可视化',
+                       class_names=None, color_theme='Plotly默认'):
     if embeddings_2d is None or len(embeddings_2d) == 0:
         return go.Figure()
 
     if labels is None:
         labels = [0] * len(embeddings_2d)
 
+    theme = COLOR_THEMES.get(color_theme, COLOR_THEMES['Plotly默认'])
+    colors = theme['colors']
+    template = theme['template']
+
     fig = go.Figure()
     unique_labels = sorted(set(labels))
-    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-              '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52']
 
     for i, lbl in enumerate(unique_labels):
         idx = [j for j, l in enumerate(labels) if l == lbl]
@@ -223,12 +290,47 @@ def plot_embeddings_2d(embeddings_2d, labels=None, title='节点嵌入降维可�
 
     fig.update_layout(
         title=title,
-        template='plotly_white',
+        template=template,
         height=500,
         xaxis_title='t-SNE/UMAP 维度1',
         yaxis_title='t-SNE/UMAP 维度2',
         legend=dict(orientation='h', yanchor='bottom', y=-0.2, xanchor='center', x=0.5),
         margin=dict(l=40, r=20, t=60, b=80)
+    )
+    return fig
+
+
+def plot_confidence_bar(probabilities, class_names=None, title='预测置信度分布',
+                        color_theme='Plotly默认'):
+    if probabilities is None or len(probabilities) == 0:
+        return go.Figure()
+
+    if class_names is None or len(class_names) != len(probabilities):
+        class_names = [f'类{i}' for i in range(len(probabilities))]
+
+    theme = COLOR_THEMES.get(color_theme, COLOR_THEMES['Plotly默认'])
+    colors = theme['colors']
+    template = theme['template']
+
+    bar_colors = [colors[i % len(colors)] for i in range(len(probabilities))]
+
+    fig = go.Figure(data=[go.Bar(
+        x=class_names,
+        y=probabilities,
+        marker_color=bar_colors,
+        text=[f'{p:.3f}' for p in probabilities],
+        textposition='auto',
+    )])
+
+    fig.update_layout(
+        title=title,
+        template=template,
+        yaxis_range=[0, 1.05],
+        yaxis_title='概率',
+        xaxis_title='类别',
+        height=280,
+        margin=dict(l=40, r=20, t=40, b=60),
+        xaxis_tickangle=-25,
     )
     return fig
 

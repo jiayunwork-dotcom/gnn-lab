@@ -23,7 +23,8 @@ from community_detect import (
 from visualizations import (
     compute_layout, plot_degree_distribution, plot_training_curves,
     plot_confusion_matrix, plot_graph, plot_embeddings_2d,
-    plot_attention_graph, plot_f1_per_class, plot_comparison_bar
+    plot_attention_graph, plot_f1_per_class, plot_comparison_bar,
+    plot_confidence_bar, COLOR_THEMES
 )
 
 st.set_page_config(page_title='GNN实验平台 - 节点分类与社区发现',
@@ -42,6 +43,11 @@ def init_session_state():
         'class_names': None,
         'community_results': {},
         'comparison_experiments': [],
+        'training_history': [],
+        'selected_history_idx': None,
+        'color_theme': 'Plotly默认',
+        'graph_edited': False,
+        'selected_node': None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -62,6 +68,145 @@ def get_class_names(num_classes, dataset_name):
         return ['糖尿病', '缺血性心脏病', '肺癌']
     else:
         return [f'类{i}' for i in range(num_classes)]
+
+
+def save_training_history(model_name, hyperparams, results, class_names):
+    import copy
+    record = {
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'model_name': model_name,
+        'hyperparams': copy.deepcopy(hyperparams),
+        'total_time': results['total_time'],
+        'test_acc': results['test_acc'],
+        'f1_macro': results['f1_macro'],
+        'best_val_acc': results['best_val_acc'],
+        'best_epoch': results['best_epoch'],
+        'history': copy.deepcopy(results['history']),
+        'confusion_matrix': results['confusion_matrix'].copy() if results['confusion_matrix'] is not None else None,
+        'f1_per_class': results['f1_per_class'].copy() if results['f1_per_class'] is not None else None,
+        'class_names': copy.deepcopy(class_names) if class_names else None,
+    }
+    history = st.session_state.training_history
+    history.append(record)
+    if len(history) > 20:
+        min_idx = min(range(len(history)), key=lambda i: history[i]['test_acc'])
+        history.pop(min_idx)
+    st.session_state.training_history = history
+
+
+def add_node_to_graph(feature_method='mean', custom_features=None):
+    if st.session_state.G is None or st.session_state.data is None:
+        return False, '请先加载数据集'
+
+    G = st.session_state.G.copy()
+    data = st.session_state.data.clone()
+    new_node_id = G.number_of_nodes()
+    G.add_node(new_node_id)
+
+    feat_dim = data.x.shape[1] if data.x is not None else 1
+    if feature_method == 'mean':
+        if data.x is not None and data.x.shape[0] > 0:
+            mean_feat = data.x.mean(dim=0).unsqueeze(0)
+        else:
+            mean_feat = torch.zeros(1, feat_dim)
+        new_x = torch.cat([data.x, mean_feat], dim=0)
+    elif feature_method == 'zero':
+        new_x = torch.cat([data.x, torch.zeros(1, feat_dim)], dim=0)
+    elif feature_method == 'custom' and custom_features is not None:
+        custom_tensor = torch.tensor(custom_features, dtype=torch.float).unsqueeze(0)
+        if custom_tensor.shape[1] != feat_dim:
+            return False, f'特征维度不匹配，应为{feat_dim}维'
+        new_x = torch.cat([data.x, custom_tensor], dim=0)
+    else:
+        new_x = torch.cat([data.x, torch.zeros(1, feat_dim)], dim=0)
+
+    data.x = new_x
+    data.num_nodes = new_node_id + 1
+
+    if hasattr(data, 'y') and data.y is not None:
+        new_y = torch.tensor([-1], dtype=torch.long)
+        data.y = torch.cat([data.y, new_y], dim=0)
+
+    for mask_name in ['train_mask', 'val_mask', 'test_mask']:
+        if hasattr(data, mask_name) and getattr(data, mask_name) is not None:
+            mask = getattr(data, mask_name)
+            new_mask = torch.cat([mask, torch.zeros(1, dtype=torch.bool)], dim=0)
+            setattr(data, mask_name, new_mask)
+
+    edge_index = data.edge_index
+    data.edge_index = edge_index
+
+    st.session_state.G = G
+    st.session_state.data = data
+    st.session_state.stats = graph_statistics(G)
+    st.session_state.pos = compute_layout(G, layout='spring', seed=42)
+
+    if st.session_state.model is not None:
+        st.session_state.graph_edited = True
+
+    return True, f'已添加节点 {new_node_id}'
+
+
+def add_edge_to_graph(u, v):
+    if st.session_state.G is None or st.session_state.data is None:
+        return False, '请先加载数据集'
+
+    max_node = st.session_state.G.number_of_nodes() - 1
+    if u < 0 or u > max_node or v < 0 or v > max_node:
+        return False, f'节点ID超出范围，有效范围: 0 ~ {max_node}'
+    if u == v:
+        return False, '不能添加自环'
+    if st.session_state.G.has_edge(u, v):
+        return False, f'边 {u}-{v} 已存在'
+
+    G = st.session_state.G.copy()
+    G.add_edge(u, v)
+
+    data = st.session_state.data.clone()
+    edge_list = list(G.edges())
+    edges_u = [e[0] for e in edge_list]
+    edges_v = [e[1] for e in edge_list]
+    edge_index = torch.tensor([edges_u + edges_v, edges_v + edges_u], dtype=torch.long)
+    data.edge_index = edge_index
+
+    st.session_state.G = G
+    st.session_state.data = data
+    st.session_state.stats = graph_statistics(G)
+
+    if st.session_state.model is not None:
+        st.session_state.graph_edited = True
+
+    return True, f'已添加边 {u}-{v}'
+
+
+def remove_edge_from_graph(u, v):
+    if st.session_state.G is None or st.session_state.data is None:
+        return False, '请先加载数据集'
+
+    if not st.session_state.G.has_edge(u, v):
+        return False, f'边 {u}-{v} 不存在'
+
+    G = st.session_state.G.copy()
+    G.remove_edge(u, v)
+
+    data = st.session_state.data.clone()
+    edge_list = list(G.edges())
+    if len(edge_list) > 0:
+        edges_u = [e[0] for e in edge_list]
+        edges_v = [e[1] for e in edge_list]
+        edge_index = torch.tensor([edges_u + edges_v, edges_v + edges_u], dtype=torch.long)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+    data.edge_index = edge_index
+
+    st.session_state.G = G
+    st.session_state.data = data
+    st.session_state.stats = graph_statistics(G)
+
+    if st.session_state.model is not None:
+        st.session_state.graph_edited = True
+
+    return True, f'已删除边 {u}-{v}'
 
 
 with st.sidebar:
@@ -156,6 +301,40 @@ with st.sidebar:
                        train_ratio=train_ratio, val_ratio=val_ratio)
             st.success('✅ 已重新划分！')
 
+    st.markdown('---')
+    st.header('📜 3. 训练历史')
+    if len(st.session_state.training_history) == 0:
+        st.info('暂无训练记录')
+    else:
+        history = st.session_state.training_history
+        sort_by = st.selectbox('排序方式', ['时间(最新)', '测试精度(高→低)', 'F1分数(高→低)'])
+        sorted_indices = list(range(len(history)))
+        if sort_by == '测试精度(高→低)':
+            sorted_indices.sort(key=lambda i: history[i]['test_acc'], reverse=True)
+        elif sort_by == 'F1分数(高→低)':
+            sorted_indices.sort(key=lambda i: history[i]['f1_macro'], reverse=True)
+        else:
+            sorted_indices.reverse()
+
+        st.caption(f'共 {len(history)} 条记录（最多保存20条）')
+
+        for rank, idx in enumerate(sorted_indices):
+            rec = history[idx]
+            is_selected = st.session_state.selected_history_idx == idx
+            btn_label = f"{'▶ ' if is_selected else ''}{rec['model_name']} · {rec['timestamp'].split(' ')[1]}"
+            btn_help = f"测试精度: {rec['test_acc']:.4f} | F1: {rec['f1_macro']:.4f} | 用时: {rec['total_time']:.1f}s"
+            if st.button(btn_label, key=f'hist_{idx}', help=btn_help, use_container_width=True,
+                         type='primary' if is_selected else 'secondary'):
+                if st.session_state.selected_history_idx == idx:
+                    st.session_state.selected_history_idx = None
+                else:
+                    st.session_state.selected_history_idx = idx
+
+        if st.button('🗑️ 清空历史', use_container_width=True):
+            st.session_state.training_history = []
+            st.session_state.selected_history_idx = None
+            st.rerun()
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     '📊 数据概览', '🧠 GNN训练', '🔍 社区发现',
     '📈 可视化分析', '⚡ 对比实验'
@@ -190,6 +369,72 @@ with tab1:
 
         st.plotly_chart(plot_degree_distribution(s['degree_dist']), use_container_width=True)
 
+        if st.session_state.graph_edited and st.session_state.model is not None:
+            st.warning('⚠️ 图结构已修改，现有模型可能不再适用，请重新训练模型')
+
+        with st.expander('✏️ 手动编辑图结构', expanded=False):
+            edit_tabs = st.tabs(['添加节点', '添加边', '删除边'])
+
+            with edit_tabs[0]:
+                st.markdown('##### 添加新节点')
+                feat_method = st.radio('特征初始化方式',
+                                       ['均值填充', '零填充', '自定义特征'],
+                                       horizontal=True, key='add_node_feat')
+                custom_feat_input = None
+                if feat_method == '自定义特征':
+                    feat_dim = st.session_state.data.x.shape[1] if st.session_state.data.x is not None else 1
+                    custom_feat_input = st.text_input(
+                        f'输入特征向量（共{feat_dim}维，用逗号分隔）',
+                        placeholder=f'例如: {",".join(["0.1"]*min(5, feat_dim))}...',
+                        key='custom_feat'
+                    )
+                if st.button('➕ 添加节点', use_container_width=True, key='btn_add_node'):
+                    method_map = {'均值填充': 'mean', '零填充': 'zero', '自定义特征': 'custom'}
+                    method = method_map[feat_method]
+                    custom_feats = None
+                    if method == 'custom' and custom_feat_input:
+                        try:
+                            custom_feats = [float(x.strip()) for x in custom_feat_input.split(',')]
+                        except ValueError:
+                            st.error('请输入有效的数字，用逗号分隔')
+                            custom_feats = None
+                    success, msg = add_node_to_graph(feature_method=method, custom_features=custom_feats)
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            with edit_tabs[1]:
+                st.markdown('##### 添加边')
+                max_node = st.session_state.G.number_of_nodes() - 1 if st.session_state.G else 0
+                ae_c1, ae_c2 = st.columns(2)
+                add_u = ae_c1.number_input('源节点ID', 0, max(0, max_node), 0, 1, key='add_edge_u')
+                add_v = ae_c2.number_input('目标节点ID', 0, max(0, max_node), 1, 1, key='add_edge_v')
+                if st.button('➕ 添加边', use_container_width=True, key='btn_add_edge'):
+                    success, msg = add_edge_to_graph(int(add_u), int(add_v))
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            with edit_tabs[2]:
+                st.markdown('##### 删除边')
+                max_node = st.session_state.G.number_of_nodes() - 1 if st.session_state.G else 0
+                re_c1, re_c2 = st.columns(2)
+                rm_u = re_c1.number_input('源节点ID', 0, max(0, max_node), 0, 1, key='rm_edge_u')
+                rm_v = re_c2.number_input('目标节点ID', 0, max(0, max_node), 1, 1, key='rm_edge_v')
+                if st.button('🗑️ 删除边', use_container_width=True, key='btn_rm_edge'):
+                    success, msg = remove_edge_from_graph(int(rm_u), int(rm_v))
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            st.caption('💡 提示：编辑图结构后，统计信息和可视化会自动更新')
+
         st.markdown('#### 图结构预览')
         viz_c1, viz_c2 = st.columns([1, 2])
         with viz_c1:
@@ -205,6 +450,27 @@ with tab1:
                 st.session_state.pos = compute_layout(G_viz, layout=layout_choice, seed=42)
                 st.success('✅ 布局已更新')
 
+            st.markdown('---')
+            st.markdown('##### 🔍 节点搜索')
+            max_node = s['num_nodes'] - 1
+            search_node = st.number_input('输入节点ID', 0, max_node, 0, 1, key='search_node_input')
+            sc1, sc2 = st.columns(2)
+            if sc1.button('📍 定位', use_container_width=True, key='btn_locate_node'):
+                st.session_state.selected_node = int(search_node)
+            if sc2.button('❌ 取消', use_container_width=True, key='btn_clear_node'):
+                st.session_state.selected_node = None
+
+            color_theme_choice = st.selectbox(
+                '配色方案',
+                list(COLOR_THEMES.keys()),
+                index=list(COLOR_THEMES.keys()).index(st.session_state.color_theme)
+                if st.session_state.color_theme in COLOR_THEMES else 0,
+                key='color_theme_viz'
+            )
+            if color_theme_choice != st.session_state.color_theme:
+                st.session_state.color_theme = color_theme_choice
+                st.rerun()
+
         with viz_c2:
             G_plot = st.session_state.G
             if display_mode == '最大连通分量' and s['num_nodes'] > 500:
@@ -214,12 +480,86 @@ with tab1:
             colors = None
             if has_labels and st.session_state.data.y is not None:
                 colors = st.session_state.data.y.cpu().numpy().tolist()
+
+            highlight = st.session_state.selected_node
+            if highlight is not None and highlight >= G_plot.number_of_nodes():
+                highlight = None
+
             fig = plot_graph(G_plot, pos=st.session_state.pos,
                              node_colors=colors if has_labels else None,
                              class_names=st.session_state.class_names,
                              show_labels=show_labels,
+                             highlight_node=highlight,
+                             color_theme=st.session_state.color_theme,
                              title='图可视化（按真实类别着色）' if has_labels else '图可视化')
             st.plotly_chart(fig, use_container_width=True)
+
+            if st.session_state.selected_node is not None:
+                node_id = st.session_state.selected_node
+                if node_id < s['num_nodes']:
+                    st.markdown('---')
+                    st.markdown(f'##### 📋 节点详情 · ID: {node_id}')
+                    degree = st.session_state.G.degree(node_id) if node_id in st.session_state.G.nodes else 0
+
+                    det_c1, det_c2 = st.columns(2)
+                    det_c1.metric('度数', degree)
+
+                    community_label = '-'
+                    if len(st.session_state.community_results) > 0:
+                        first_alg = list(st.session_state.community_results.keys())[0]
+                        labels = st.session_state.community_results[first_alg]['labels']
+                        if node_id < len(labels):
+                            community_label = int(labels[node_id])
+                    det_c2.metric('所属社区', community_label)
+
+                    if st.session_state.num_classes > 0 and st.session_state.data.y is not None:
+                        true_label = st.session_state.data.y[node_id].item()
+                        true_label_name = st.session_state.class_names[true_label] \
+                            if st.session_state.class_names and true_label < len(st.session_state.class_names) \
+                            else f'类{true_label}'
+                        det_c1.metric('真实标签', true_label_name)
+
+                    if st.session_state.model is not None and not st.session_state.graph_edited:
+                        try:
+                            device = next(st.session_state.model.parameters()).device
+                            st.session_state.model.eval()
+                            with torch.no_grad():
+                                out = st.session_state.model(
+                                    st.session_state.data.x.to(device),
+                                    st.session_state.data.edge_index.to(device)
+                                )
+                                probs = torch.softmax(out, dim=1)[node_id].cpu().numpy()
+                                pred_label = int(probs.argmax())
+                                pred_conf = float(probs.max())
+                                pred_label_name = st.session_state.class_names[pred_label] \
+                                    if st.session_state.class_names and pred_label < len(st.session_state.class_names) \
+                                    else f'类{pred_label}'
+                                det_c2.metric('预测标签', f'{pred_label_name}')
+                                st.plotly_chart(
+                                    plot_confidence_bar(
+                                        probs,
+                                        st.session_state.class_names,
+                                        color_theme=st.session_state.color_theme
+                                    ),
+                                    use_container_width=True
+                                )
+                        except Exception as e:
+                            st.info(f'无法获取预测: {str(e)}')
+
+                    st.markdown('##### 👥 一阶邻居')
+                    neighbors = list(st.session_state.G.neighbors(node_id)) if node_id in st.session_state.G.nodes else []
+                    if len(neighbors) == 0:
+                        st.info('该节点没有邻居')
+                    else:
+                        st.caption(f'共 {len(neighbors)} 个邻居')
+                        nb_cols = st.columns(min(5, len(neighbors)))
+                        for i, nb in enumerate(neighbors[:10]):
+                            with nb_cols[i % 5]:
+                                if st.button(f'🔗 {nb}', key=f'nb_{node_id}_{nb}', use_container_width=True):
+                                    st.session_state.selected_node = int(nb)
+                                    st.rerun()
+                        if len(neighbors) > 10:
+                            st.caption(f'还有 {len(neighbors) - 10} 个邻居未显示')
 
 with tab2:
     st.subheader('🧠 GNN模型训练与评估')
@@ -304,9 +644,56 @@ with tab2:
                 trained_model, st.session_state.data, device=device, layer=-1
             )
 
-            st.success(f'✅ 训练完成！用时 {results["total_time"]:.2f}s')
+            hyperparams = {
+                'num_layers': num_layers,
+                'hidden_dim': hidden_dim,
+                'activation': activation,
+                'dropout': dropout,
+                'lr': lr,
+                'weight_decay': weight_decay,
+                'max_epochs': max_epochs,
+                'patience': patience,
+            }
+            hyperparams.update(extra_kwargs)
+            save_training_history(model_name, hyperparams, results, st.session_state.class_names)
+            st.session_state.graph_edited = False
 
-        if st.session_state.results is not None:
+            st.success(f'✅ 训练完成！用时 {results["total_time"]:.2f}s · 已保存到训练历史')
+
+        if st.session_state.selected_history_idx is not None:
+            rec = st.session_state.training_history[st.session_state.selected_history_idx]
+            st.markdown('---')
+            st.subheader(f'📜 历史记录回溯 · {rec["model_name"]}')
+            st.caption(f'训练时间: {rec["timestamp"]}')
+
+            hr1, hr2, hr3, hr4 = st.columns(4)
+            hr1.metric('最佳验证精度', f'{rec["best_val_acc"]:.4f}',
+                       f'Epoch {rec["best_epoch"]}')
+            hr2.metric('测试集精度', f'{rec["test_acc"]:.4f}')
+            hr3.metric('Macro F1', f'{rec["f1_macro"]:.4f}')
+            hr4.metric('训练用时', f'{rec["total_time"]:.1f}s')
+
+            with st.expander('🔧 超参数配置', expanded=False):
+                hp = rec['hyperparams']
+                hp_cols = st.columns(3)
+                for i, (k, v) in enumerate(hp.items()):
+                    hp_cols[i % 3].info(f'**{k}**: {v}')
+
+            st.plotly_chart(plot_training_curves(rec['history']), use_container_width=True)
+
+            hpc1, hpc2 = st.columns(2)
+            with hpc1:
+                if rec['f1_per_class'] is not None:
+                    st.plotly_chart(plot_f1_per_class(
+                        rec['f1_per_class'], rec['class_names']
+                    ), use_container_width=True)
+            with hpc2:
+                if rec['confusion_matrix'] is not None:
+                    st.plotly_chart(plot_confusion_matrix(
+                        rec['confusion_matrix'], rec['class_names']
+                    ), use_container_width=True)
+
+        if st.session_state.results is not None and st.session_state.selected_history_idx is None:
             r = st.session_state.results
             st.markdown('---')
             rc1, rc2, rc3, rc4 = st.columns(4)
@@ -417,6 +804,7 @@ with tab3:
                     fig = plot_graph(
                         st.session_state.G, pos=st.session_state.pos,
                         node_colors=colors,
+                        color_theme=st.session_state.color_theme,
                         title=f'{alg} 社区划分'
                     )
                     st.plotly_chart(fig, use_container_width=True)
@@ -447,6 +835,7 @@ with tab4:
                     fig1 = plot_graph(
                         st.session_state.G, pos=st.session_state.pos,
                         node_colors=colors, class_names=st.session_state.class_names,
+                        color_theme=st.session_state.color_theme,
                         title='真实类别标签' if has_labels else '图结构'
                     )
                     st.plotly_chart(fig1, use_container_width=True)
@@ -460,6 +849,7 @@ with tab4:
                             fig2 = plot_graph(
                                 st.session_state.G, pos=st.session_state.pos,
                                 node_colors=res['labels'].tolist(),
+                                color_theme=st.session_state.color_theme,
                                 title=f'{chosen_alg} 社区划分'
                             )
                             st.plotly_chart(fig2, use_container_width=True)
@@ -497,7 +887,8 @@ with tab4:
                 fig = plot_embeddings_2d(
                     reduced, labels=labels,
                     title=f'节点嵌入 {dr_method} 降维可视化',
-                    class_names=st.session_state.class_names
+                    class_names=st.session_state.class_names,
+                    color_theme=st.session_state.color_theme
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
